@@ -41,4 +41,5 @@ BUILD -> TEST -> FIX -> RETEST -> PASS -> COMMIT -> PUSH
 ```
 
 No phase may begin before the previous phase's validation and documentation
-are complete. This task stops after Phase 0; it does not begin Phase 1.
+are complete. Phase 0 is complete and locked. Phase 1 foundation is complete and
+validated. Future phases remain in the roadmap and have not started.

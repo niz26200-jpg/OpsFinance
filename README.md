@@ -12,10 +12,20 @@ The primary domain is `myops.com.my`; the application domain is
 
 ## Phase 0 status
 
-This repository currently contains the locked product specification and
-technical foundation only. It intentionally contains no application screens,
-database migrations, authentication, payment processing, or accounting
-implementation.
+Phase 0 baseline is complete and locked. It contains the authoritative product,
+accounting, data, security, roadmap, and contribution foundation for the
+project.
+
+## Phase 1 status
+
+Phase 1 foundation is complete. This repository now includes a minimal Next.js
+application, TypeScript configuration, PostgreSQL/Supabase migration schema,
+seeded default Chart of Accounts structure, business membership/auth foundation,
+minimal authentication UI, and automated tests for the required scaffolding.
+
+The repository does not yet include the accounting posting engine, ledger,
+financial reports, reconciliation, upload conversion, or subscription payment
+processing.
 
 Read the documents in this order:
 

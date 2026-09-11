@@ -14,9 +14,19 @@ server-side and business-scoped. Every query and mutation must enforce
 
 The data model supports future roles through `business_members.role`. Starter
 currently permits one user, but this is an entitlement, not a reason to remove
-membership or role structure. PostgreSQL Row Level Security may provide a
-defense-in-depth layer; backend authorization checks remain mandatory and are
-the authoritative application control.
+membership or role structure. PostgreSQL Row Level Security is now the
+hardening baseline for business-owned tables; backend authorization checks
+remain mandatory and are the authoritative application control.
+
+The implemented model is:
+
+- authenticated user -> `users` row matching `auth.uid()`
+- `business_members` ties the user to a business
+- business-owned tables enforce `business_id` membership checks
+- application queries may only read and modify rows for businesses the user is
+  authorized to access
+- service-role access remains reserved for trusted server-side operations and
+  must not be used from browser code
 
 ## Accounting integrity
 
@@ -36,9 +46,24 @@ the authoritative application control.
 
 All business-owned data is filtered and authorized by `business_id`.
 Cross-business foreign keys are rejected. Tests must include attempts to read,
-modify, match, upload, or post another business's records. RLS can be enabled
-on PostgreSQL tables after the application connection context is established,
-but it must not substitute for explicit backend checks.
+modify, match, upload, or post another business's records. The database layer
+now enforces business membership for all relevant tables via RLS. These checks
+must not substitute for explicit backend checks, but they materially reduce the
+risk of client-driven business contamination.
+
+The core access predicate is:
+
+```sql
+exists (
+  select 1
+  from public.business_members bm
+  where bm.user_id = auth.uid()
+    and bm.business_id = target_table.business_id
+)
+```
+
+This is enforced for business-scoped tables, while user-facing profile access is
+restricted to the authenticated user's own row.
 
 ## Upload security
 

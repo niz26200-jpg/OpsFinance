@@ -23,6 +23,12 @@ application, TypeScript configuration, PostgreSQL/Supabase migration schema,
 seeded default Chart of Accounts structure, business membership/auth foundation,
 minimal authentication UI, and automated tests for the required scaffolding.
 
+Phase 1.5 is in progress for Supabase UAT verification and database security
+hardening. Live UAT verification remains blocked by the absence of a configured
+Supabase staging project, CLI credentials, and environment variables in this
+workspace. The migration and RLS hardening are prepared for deployment, but they
+have not been applied against a live UAT database in this environment.
+
 The repository does not yet include the accounting posting engine, ledger,
 financial reports, reconciliation, upload conversion, or subscription payment
 processing.

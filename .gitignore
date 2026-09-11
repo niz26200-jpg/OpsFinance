@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Build and coverage output
+.next/
+dist/
+build/
+coverage/
+expo/.expo/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local data and uploads
+*.sqlite
+*.db
+uploads/
+tmp/
+
+# Logs and OS/editor files
+*.log
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json

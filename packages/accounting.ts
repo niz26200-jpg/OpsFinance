@@ -167,6 +167,10 @@ export class DecimalMoney {
     return 0;
   }
 
+  abs(): DecimalMoney {
+    return new DecimalMoney(this.cents < 0n ? -this.cents : this.cents);
+  }
+
   isPositive(): boolean {
     return this.cents > 0n;
   }

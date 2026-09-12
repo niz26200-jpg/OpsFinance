@@ -157,6 +157,7 @@ export function TransactionWorkflow() {
             <Link href="/" style={{ padding: '0.65rem 1rem', borderRadius: 10, background: '#e2e8f0' }}>Home</Link>
             <Link href="/login" style={{ padding: '0.65rem 1rem', borderRadius: 10, background: '#e2e8f0' }}>Login</Link>
             <Link href="/register" style={{ padding: '0.65rem 1rem', borderRadius: 10, background: '#e2e8f0' }}>Register</Link>
+            <Link href="/reconciliation" style={{ padding: '0.65rem 1rem', borderRadius: 10, background: '#dbeafe' }}>Reconciliation</Link>
           </nav>
         </header>
 

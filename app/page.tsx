@@ -8,6 +8,9 @@ export default function Page() {
       <ul>
         <li><Link href="/login">Login</Link></li>
         <li><Link href="/register">Register</Link></li>
+        <li><Link href="/transactions">Transactions</Link></li>
+        <li><Link href="/upload">Upload & Convert</Link></li>
+        <li><Link href="/reconciliation">Bank Reconciliation</Link></li>
       </ul>
     </main>
   );

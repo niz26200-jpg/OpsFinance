@@ -11,6 +11,7 @@ export default function Page() {
         <li><Link href="/transactions">Transactions</Link></li>
         <li><Link href="/upload">Upload & Convert</Link></li>
         <li><Link href="/reconciliation">Bank Reconciliation</Link></li>
+        <li><Link href="/reports">Financial Reports</Link></li>
       </ul>
     </main>
   );

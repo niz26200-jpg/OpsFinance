@@ -79,6 +79,23 @@ export function createDemoTransactionService(): TransactionService {
 export type TransactionType = 'MONEY_IN' | 'MONEY_OUT' | 'TRANSFER' | 'JOURNAL';
 export type TransactionStatus = 'DRAFT' | 'REVIEW' | 'APPROVED' | 'POSTED' | 'VOIDED';
 
+export interface TransactionAuditEvent {
+  businessId: string;
+  actor: string;
+  action: string;
+  entityType: 'TRANSACTION' | 'JOURNAL';
+  entityId: string;
+  timestamp: string;
+  details?: string;
+}
+
+export interface TransactionValidationResult {
+  isValid: boolean;
+  errors: string[];
+  totalDebit: string;
+  totalCredit: string;
+}
+
 export interface TransactionLineInput {
   accountId: string;
   debit?: string;
@@ -121,6 +138,7 @@ export interface TransactionRecord {
   journalId?: string;
   journal?: JournalEntry;
   lines?: TransactionLineInput[];
+  auditTrail?: TransactionAuditEvent[];
 }
 
 export class TransactionService {
@@ -145,8 +163,171 @@ export class TransactionService {
     return transaction;
   }
 
+  getAuditTrail(transactionId: string): TransactionAuditEvent[] {
+    const transaction = this.getTransaction(transactionId);
+    return transaction.auditTrail ?? [];
+  }
+
+  private addAuditEvent(transaction: TransactionRecord, action: string, actor: string, details?: string): TransactionRecord {
+    const auditTrail: TransactionAuditEvent[] = [
+      ...(transaction.auditTrail ?? []),
+      {
+        businessId: transaction.businessId,
+        actor,
+        action,
+        entityType: 'TRANSACTION',
+        entityId: transaction.id,
+        timestamp: new Date().toISOString(),
+        details,
+      },
+    ];
+
+    return {
+      ...transaction,
+      auditTrail,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  validateTransaction(input: TransactionRecord | TransactionCreateInput): TransactionValidationResult {
+    const transaction = 'status' in input ? input : {
+      businessId: input.businessId,
+      type: input.type,
+      date: input.date,
+      description: input.description,
+      amount: input.amount ?? '0.00',
+      referenceNo: input.referenceNo,
+      financialAccountId: input.financialAccountId,
+      accountId: input.accountId,
+      fromFinancialAccountId: input.fromFinancialAccountId,
+      toFinancialAccountId: input.toFinancialAccountId,
+      lines: input.lines ?? [],
+      status: 'DRAFT' as TransactionStatus,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      id: 'validation-tx',
+    };
+
+    const errors: string[] = [];
+    const amountValue = Number(transaction.amount ?? '0.00');
+
+    if (!transaction.businessId) {
+      errors.push('Business is required.');
+    }
+    if (!transaction.date) {
+      errors.push('Transaction date is required.');
+    }
+    if (!transaction.description?.trim()) {
+      errors.push('Transaction description is required.');
+    }
+    if (!Number.isFinite(amountValue) || amountValue <= 0) {
+      errors.push('Transaction amount must be a positive number.');
+    }
+
+    try {
+      this.engine.authorizeBusiness(transaction.businessId, this.engine.businessId);
+    } catch {
+      errors.push('Business authorization failed.');
+    }
+
+    if (transaction.type === 'MONEY_IN') {
+      if (!transaction.financialAccountId) {
+        errors.push('Money In requires a financial account.');
+      }
+      if (!transaction.accountId) {
+        errors.push('Money In requires a revenue account.');
+      }
+    }
+
+    if (transaction.type === 'MONEY_OUT') {
+      if (!transaction.financialAccountId) {
+        errors.push('Money Out requires a financial account.');
+      }
+      if (!transaction.accountId) {
+        errors.push('Money Out requires an expense account.');
+      }
+    }
+
+    if (transaction.type === 'TRANSFER') {
+      if (!transaction.fromFinancialAccountId || !transaction.toFinancialAccountId) {
+        errors.push('Transfer requires source and destination financial accounts.');
+      }
+      if (transaction.fromFinancialAccountId && transaction.toFinancialAccountId && transaction.fromFinancialAccountId === transaction.toFinancialAccountId) {
+        errors.push('Source and destination accounts cannot be the same.');
+      }
+    }
+
+    if (transaction.type === 'JOURNAL') {
+      const lines = transaction.lines ?? [];
+      if (lines.length < 2) {
+        errors.push('Journal entries require at least two lines.');
+      }
+      if (lines.some((line) => !line.accountId)) {
+        errors.push('Journal line account is required.');
+      }
+      if (lines.some((line) => Number(line.debit ?? '0') <= 0 && Number(line.credit ?? '0') <= 0)) {
+        errors.push('Each journal line must have a positive debit or credit amount.');
+      }
+      if (lines.some((line) => Number(line.debit ?? '0') > 0 && Number(line.credit ?? '0') > 0)) {
+        errors.push('Journal line cannot contain both debit and credit values.');
+      }
+    }
+
+    const journal = this.buildJournal(
+      {
+        businessId: transaction.businessId,
+        type: transaction.type,
+        date: transaction.date,
+        description: transaction.description,
+        amount: transaction.amount ?? '0.00',
+        referenceNo: transaction.referenceNo,
+        financialAccountId: transaction.financialAccountId,
+        accountId: transaction.accountId,
+        fromFinancialAccountId: transaction.fromFinancialAccountId,
+        toFinancialAccountId: transaction.toFinancialAccountId,
+        lines: transaction.lines ?? [],
+        createdBy: transaction.createdBy,
+      },
+      transaction.amount ?? '0.00',
+    );
+
+    try {
+      const validation = this.engine.validateJournal(journal);
+      if (!validation.isValid) {
+        errors.push(...validation.errors);
+      }
+      return {
+        isValid: errors.length === 0,
+        errors,
+        totalDebit: validation.totalDebit,
+        totalCredit: validation.totalCredit,
+      };
+    } catch (error) {
+      errors.push((error as Error).message);
+      return {
+        isValid: false,
+        errors,
+        totalDebit: '0.00',
+        totalCredit: '0.00',
+      };
+    }
+  }
+
   createTransaction(input: TransactionCreateInput): TransactionRecord {
     this.engine.authorizeBusiness(input.businessId, this.engine.businessId);
+
+    if (input.idempotencyKey && this.idempotency.has(input.idempotencyKey)) {
+      const existingId = this.idempotency.get(input.idempotencyKey);
+      const existing = existingId ? this.transactions.get(existingId) : undefined;
+      if (existing) {
+        return existing;
+      }
+    }
+
+    const validation = this.validateTransaction(input);
+    if (!validation.isValid) {
+      throw new Error(validation.errors.join(' '));
+    }
 
     if (!input.date) {
       throw new Error('Transaction date is required.');
@@ -170,24 +351,27 @@ export class TransactionService {
       createdAt: now,
       updatedAt: now,
       lines: input.lines ?? [],
+      auditTrail: [
+        {
+          businessId: input.businessId,
+          actor: input.createdBy ?? 'system',
+          action: 'TRANSACTION_CREATED',
+          entityType: 'TRANSACTION',
+          entityId: 'pending',
+          timestamp: now,
+          details: input.description,
+        },
+      ],
     };
 
-    if (input.idempotencyKey && this.idempotency.has(input.idempotencyKey)) {
-      return this.transactions.get(this.idempotency.get(input.idempotencyKey) ?? '') ?? baseRecord;
-    }
-
     const journal = this.buildJournal(input, baseRecord.amount);
-    const validation = this.engine.validateJournal(journal);
-    if (!validation.isValid) {
-      throw new Error(validation.errors.join(' '));
-    }
-
     const createdJournal = this.engine.createJournal(journal);
     const transaction: TransactionRecord = {
       ...baseRecord,
       journalId: createdJournal.id,
       journal: createdJournal,
       amount: baseRecord.amount,
+      auditTrail: baseRecord.auditTrail?.map((event) => ({ ...event, entityId: `txn-${Date.now()}` })),
     };
 
     this.transactions.set(transaction.id, transaction);
@@ -196,6 +380,54 @@ export class TransactionService {
     }
 
     return transaction;
+  }
+
+  reviewTransaction(transactionId: string, reviewedBy: string): TransactionRecord {
+    const transaction = this.getTransaction(transactionId);
+    if (transaction.status === 'POSTED' || transaction.status === 'VOIDED') {
+      throw new Error('Only non-posted transactions can be reviewed.');
+    }
+
+    const updated = this.addAuditEvent({
+      ...transaction,
+      status: 'REVIEW',
+      updatedAt: new Date().toISOString(),
+    }, 'TRANSACTION_REVIEWED', reviewedBy, `Reviewed by ${reviewedBy}`);
+
+    this.transactions.set(transactionId, updated);
+    return updated;
+  }
+
+  approveTransaction(transactionId: string, approvedBy: string): TransactionRecord {
+    const transaction = this.getTransaction(transactionId);
+    if (transaction.status === 'POSTED' || transaction.status === 'VOIDED') {
+      throw new Error('Only active transactions can be approved.');
+    }
+
+    const updated = this.addAuditEvent({
+      ...transaction,
+      status: 'APPROVED',
+      updatedAt: new Date().toISOString(),
+    }, 'TRANSACTION_APPROVED', approvedBy, `Approved by ${approvedBy}`);
+
+    this.transactions.set(transactionId, updated);
+    return updated;
+  }
+
+  voidTransaction(transactionId: string, voidedBy: string, reason: string): TransactionRecord {
+    const transaction = this.getTransaction(transactionId);
+    if (transaction.status === 'POSTED') {
+      throw new Error('Posted transactions must be reversed instead of voided.');
+    }
+
+    const updated = this.addAuditEvent({
+      ...transaction,
+      status: 'VOIDED',
+      updatedAt: new Date().toISOString(),
+    }, 'TRANSACTION_VOIDED', voidedBy, reason);
+
+    this.transactions.set(transactionId, updated);
+    return updated;
   }
 
   postTransaction(transactionId: string, postedBy: string, idempotencyKey?: string): TransactionRecord {
@@ -216,6 +448,10 @@ export class TransactionService {
       return existing;
     }
 
+    if (existing.status === 'VOIDED') {
+      throw new Error('Void transactions cannot be posted.');
+    }
+
     if (!existing.journal) {
       throw new Error('Transaction journal is missing.');
     }
@@ -225,13 +461,13 @@ export class TransactionService {
       idempotencyKey,
     });
 
-    const updated: TransactionRecord = {
+    const updated: TransactionRecord = this.addAuditEvent({
       ...existing,
       status: 'POSTED',
       updatedAt: new Date().toISOString(),
       journal: postedJournal,
       journalId: postedJournal.id,
-    };
+    }, 'TRANSACTION_POSTED', postedBy, `Journal ${postedJournal.journalNo} posted`);
 
     this.transactions.set(transactionId, updated);
     if (idempotencyKey) {

@@ -131,4 +131,28 @@ describe('Phase 3 transaction workflow', () => {
     expect(first.id).toBe(second.id);
     expect(first.status).toBe('POSTED');
   });
+
+  it('validates lifecycle transitions and review approval before posting', () => {
+    const service = new TransactionService(engine);
+    const tx = service.createTransaction({
+      businessId,
+      type: 'MONEY_OUT',
+      date: '2026-09-12',
+      financialAccountId: bankAccountId,
+      amount: '25.00',
+      description: 'Petrol purchase',
+      accountId: expenseAccountId,
+      createdBy: 'user-1',
+    });
+
+    const validation = service.validateTransaction(tx);
+    expect(validation.isValid).toBe(true);
+
+    const approved = service.approveTransaction(tx.id, 'reviewer-1');
+    expect(approved.status).toBe('APPROVED');
+
+    const posted = service.postTransaction(approved.id, 'user-1', 'approved-money-out');
+    expect(posted.status).toBe('POSTED');
+    expect(posted.journal).toBeTruthy();
+  });
 });

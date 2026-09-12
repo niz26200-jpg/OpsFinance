@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 
 import { UploadConvertService } from '../../packages/upload';
 import { AccountingEngine } from '../../packages/accounting';
@@ -23,15 +23,65 @@ const engine = new AccountingEngine({
 const service = new UploadConvertService(engine);
 
 export default function UploadPage() {
+  const [sourceType, setSourceType] = useState<'BANK_STATEMENT' | 'INVOICE' | 'RECEIPT'>('BANK_STATEMENT');
   const [csv, setCsv] = useState('Date,Description,Reference,Debit,Credit,Balance\n2026-09-12,Customer payment,INV-1001,,500.00,5000.00\n2026-09-11,Petrol purchase,FUEL-001,100.00,,4900.00');
+  const [reviewText, setReviewText] = useState('Supplier: ACME Ltd\nInvoice: INV-9001\nDate: 2026-09-05\nTotal: RM2000.00\nTax: RM160.00');
   const [result, setResult] = useState<string | null>(null);
+  const [candidates, setCandidates] = useState<Array<{ id: string; description: string; amount: string; status: string }>>([]);
+
+  const workflowSteps = useMemo(() => ['Upload', 'Processing', 'Review', 'Mapping', 'Approval', 'Posting Result'], []);
 
   const handleUpload = () => {
     try {
-      const batch = service.processBankStatementCsv(csv, 'bank-statement.csv', businessId, 'demo-user');
-      setResult(`Uploaded ${batch.candidates.length} candidate transactions. ${batch.errors.length} errors recorded.`);
+      let candidateList: Array<{ id: string; description: string; amount: string; status: string }> = [];
+
+      if (sourceType === 'BANK_STATEMENT') {
+        const batch = service.processBankStatementCsv(csv, 'bank-statement.csv', businessId, 'demo-user');
+        candidateList = batch.candidates.map((candidate) => ({
+          id: candidate.id,
+          description: candidate.normalized.description,
+          amount: candidate.normalized.amount,
+          status: candidate.status,
+        }));
+        setResult(`Parsed ${batch.candidates.length} bank statement rows; ${batch.errors.length} row errors recorded.`);
+      }
+
+      if (sourceType === 'INVOICE') {
+        const candidate = service.extractInvoice({ businessId, sourceType: 'INVOICE', rawText: reviewText, uploadedBy: 'demo-user' });
+        candidateList = [{ id: candidate.id, description: candidate.normalized.description, amount: candidate.normalized.amount, status: candidate.status }];
+        setResult(`Invoice parsed for review. Amount: RM${candidate.normalized.amount}`);
+      }
+
+      if (sourceType === 'RECEIPT') {
+        const candidate = service.extractReceipt({ businessId, sourceType: 'RECEIPT', rawText: reviewText, uploadedBy: 'demo-user' });
+        candidateList = [{ id: candidate.id, description: candidate.normalized.description, amount: candidate.normalized.amount, status: candidate.status }];
+        setResult(`Receipt parsed for review. Amount: RM${candidate.normalized.amount}`);
+      }
+
+      setCandidates(candidateList);
     } catch (error) {
       setResult(error instanceof Error ? error.message : 'Upload failed');
+      setCandidates([]);
+    }
+  };
+
+  const handleApprove = (candidateId: string) => {
+    try {
+      const approved = service.approveCandidate(candidateId, 'demo-user');
+      setResult(`Approved candidate ${approved.id}. Ready for posting.`);
+      setCandidates((current) => current.map((candidate) => candidate.id === approved.id ? { ...candidate, status: approved.status } : candidate));
+    } catch (error) {
+      setResult(error instanceof Error ? error.message : 'Approval failed');
+    }
+  };
+
+  const handlePost = (candidateId: string) => {
+    try {
+      const posted = service.postApprovedCandidate(candidateId, 'demo-user', businessId);
+      setResult(`Posting succeeded. Journal: ${(posted as { journalId?: string }).journalId ?? 'posted'}`);
+      setCandidates((current) => current.map((candidate) => candidate.id === candidateId ? { ...candidate, status: 'POSTED' } : candidate));
+    } catch (error) {
+      setResult(error instanceof Error ? error.message : 'Posting failed');
     }
   };
 
@@ -50,29 +100,56 @@ export default function UploadPage() {
         </header>
 
         <section style={{ padding: '1.5rem' }}>
+          <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', marginBottom: '1rem' }}>
+            {workflowSteps.map((step) => (
+              <span key={step} style={{ border: '1px solid #cbd5e1', borderRadius: 999, padding: '0.45rem 0.8rem', fontSize: 12, fontWeight: 700, color: '#0f172a' }}>{step}</span>
+            ))}
+          </div>
+
           <div style={{ display: 'grid', gap: '1rem', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
-            <div style={{ border: '1px solid #e2e8f0', borderRadius: 16, padding: '1rem' }}>
-              <div style={{ fontSize: 12, color: '#475569', marginBottom: '0.5rem' }}>Upload type</div>
-              <strong>Bank Statement</strong>
-            </div>
-            <div style={{ border: '1px solid #e2e8f0', borderRadius: 16, padding: '1rem' }}>
-              <div style={{ fontSize: 12, color: '#475569', marginBottom: '0.5rem' }}>Supported</div>
-              <strong>CSV / Excel / PDF review</strong>
-            </div>
-            <div style={{ border: '1px solid #e2e8f0', borderRadius: 16, padding: '1rem' }}>
-              <div style={{ fontSize: 12, color: '#475569', marginBottom: '0.5rem' }}>Workflow</div>
-              <strong>Parse → Review → Approve → Post</strong>
-            </div>
+            {(['BANK_STATEMENT', 'INVOICE', 'RECEIPT'] as const).map((type) => (
+              <button key={type} type="button" onClick={() => setSourceType(type)} style={{ border: sourceType === type ? '2px solid #0f172a' : '1px solid #cbd5e1', borderRadius: 12, padding: '0.9rem 1rem', background: sourceType === type ? '#e2e8f0' : '#fff', fontWeight: 700, textAlign: 'left' }}>
+                {type.replace('_', ' ')}
+              </button>
+            ))}
           </div>
 
           <div style={{ marginTop: '1.25rem', display: 'grid', gap: '1rem' }}>
-            <label style={{ display: 'grid', gap: 8 }}>
-              <span style={{ color: '#475569', fontSize: 12, fontWeight: 700 }}>CSV sample</span>
-              <textarea value={csv} onChange={(event) => setCsv(event.target.value)} rows={12} style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 10, padding: '0.9rem', fontFamily: 'monospace' }} />
-            </label>
-            <button type="button" onClick={handleUpload} style={{ width: 'fit-content', border: 'none', background: '#0f172a', color: '#fff', padding: '0.8rem 1.2rem', borderRadius: 10, cursor: 'pointer', fontWeight: 700 }}>
-              Validate & parse
-            </button>
+            {sourceType === 'BANK_STATEMENT' ? (
+              <label style={{ display: 'grid', gap: 8 }}>
+                <span style={{ color: '#475569', fontSize: 12, fontWeight: 700 }}>Bank statement CSV</span>
+                <textarea value={csv} onChange={(event) => setCsv(event.target.value)} rows={12} style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 10, padding: '0.9rem', fontFamily: 'monospace' }} />
+              </label>
+            ) : (
+              <label style={{ display: 'grid', gap: 8 }}>
+                <span style={{ color: '#475569', fontSize: 12, fontWeight: 700 }}>Review text</span>
+                <textarea value={reviewText} onChange={(event) => setReviewText(event.target.value)} rows={8} style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 10, padding: '0.9rem', fontFamily: 'monospace' }} />
+              </label>
+            )}
+
+            <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+              <button type="button" onClick={handleUpload} style={{ background: '#0f172a', color: '#fff', padding: '0.8rem 1.2rem', borderRadius: 10, border: 'none', cursor: 'pointer', fontWeight: 700 }}>
+                Parse & review
+              </button>
+            </div>
+
+            {candidates.length > 0 ? (
+              <div style={{ border: '1px solid #e2e8f0', borderRadius: 12, padding: '1rem', display: 'grid', gap: '0.75rem' }}>
+                {candidates.map((candidate) => (
+                  <div key={candidate.id} style={{ border: '1px solid #e2e8f0', borderRadius: 10, padding: '0.9rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+                    <div>
+                      <strong>{candidate.description}</strong>
+                      <div style={{ color: '#475569', fontSize: 12 }}>Amount: RM{candidate.amount} · Status: {candidate.status}</div>
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                      <button type="button" onClick={() => handleApprove(candidate.id)} style={{ border: '1px solid #0f172a', borderRadius: 8, background: '#fff', padding: '0.5rem 0.8rem', cursor: 'pointer' }}>Approve</button>
+                      <button type="button" onClick={() => handlePost(candidate.id)} style={{ border: '1px solid #0f172a', borderRadius: 8, background: '#0f172a', color: '#fff', padding: '0.5rem 0.8rem', cursor: 'pointer' }}>Post</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
             {result ? <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: '0.9rem' }}>{result}</div> : null}
           </div>
         </section>

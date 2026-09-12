@@ -547,7 +547,17 @@ export class AccountingEngine {
 
     const debitTotal = entries.reduce((sum, entry) => sum.add(new DecimalMoney(entry.debit)), DecimalMoney.zero());
     const creditTotal = entries.reduce((sum, entry) => sum.add(new DecimalMoney(entry.credit)), DecimalMoney.zero());
-    const balance = debitTotal.subtract(creditTotal);
+    const account = this.accounts.get(input.accountId) ?? {
+      id: input.accountId,
+      businessId: input.businessId,
+      code: 'UNKNOWN',
+      name: 'Unknown',
+      accountType: 'ASSET',
+      normalBalance: 'DEBIT' as const,
+      isSystem: false,
+      isActive: true,
+    };
+    const balance = account.normalBalance === 'CREDIT' ? creditTotal.subtract(debitTotal) : debitTotal.subtract(creditTotal);
 
     return {
       businessId: input.businessId,
@@ -573,12 +583,16 @@ export class AccountingEngine {
       }
     }
 
-    const accounts = [...accountMap.entries()].map(([accountId, totals]) => ({
-      accountId,
-      debit: totals.debit.toString(),
-      credit: totals.credit.toString(),
-      balance: totals.debit.subtract(totals.credit).toString(),
-    }));
+    const accounts = [...accountMap.entries()].map(([accountId, totals]) => {
+      const account = this.accounts.get(accountId) ?? { normalBalance: 'DEBIT' as const };
+      const balance = account.normalBalance === 'CREDIT' ? totals.credit.subtract(totals.debit) : totals.debit.subtract(totals.credit);
+      return {
+        accountId,
+        debit: totals.debit.toString(),
+        credit: totals.credit.toString(),
+        balance: balance.toString(),
+      };
+    });
 
     return { businessId, accounts };
   }

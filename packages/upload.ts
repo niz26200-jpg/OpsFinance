@@ -1,5 +1,5 @@
 import { AccountingEngine, DecimalMoney } from './accounting';
-import { TransactionService } from './transactions';
+import { TransactionService, type TransactionRecord } from './transactions';
 
 export type UploadType = 'BANK_STATEMENT' | 'PDF' | 'CSV' | 'EXCEL' | 'RECEIPT' | 'INVOICE';
 export type ExtractionStatus = 'IMPORTED' | 'PARSED' | 'REVIEW' | 'MAPPED' | 'APPROVED' | 'POSTED' | 'RECONCILED';
@@ -11,6 +11,32 @@ export interface UploadFile {
   size: number;
   type: string;
   content?: string;
+}
+
+export interface UploadRecord {
+  id: string;
+  businessId: string;
+  filename: string;
+  fileHash: string;
+  fileType: string;
+  sourceType: UploadType;
+  status: 'REJECTED' | 'UPLOADED' | 'PARSED' | 'REVIEW' | 'APPROVED' | 'POSTED';
+  uploadedBy: string;
+  uploadedAt: string;
+  parsedAt?: string | null;
+  approvedAt?: string | null;
+  postedAt?: string | null;
+  errorInfo?: string[];
+  duplicateReference?: string | null;
+}
+
+export interface UploadAuditEvent {
+  businessId: string;
+  actor: string;
+  event: string;
+  target: string;
+  timestamp: string;
+  metadata?: Record<string, string | number | boolean | null>;
 }
 
 export interface ValidationResult {
@@ -68,15 +94,157 @@ export interface ImportBatch {
 
 export class UploadConvertService {
   private readonly engine: AccountingEngine;
+  private readonly transactionService: TransactionService;
   private readonly batches = new Map<string, ImportBatch>();
-  private readonly idempotency = new Map<string, string>();
+  private readonly uploads = new Map<string, UploadRecord>();
+  private readonly hashIndex = new Map<string, string>();
+  private readonly idempotency = new Map<string, TransactionRecord>();
+  private readonly uploadAuditTrail = new Map<string, UploadAuditEvent[]>();
 
   constructor(engine: AccountingEngine) {
     this.engine = engine;
+    this.transactionService = new TransactionService(engine);
+  }
+
+  createUploadRecord(file: UploadFile, businessId: string, uploadedBy: string, sourceType: UploadType): UploadRecord {
+    this.engine.authorizeBusiness(businessId, this.engine.businessId);
+    const validation = this.validateFile(file);
+    if (!validation.isValid) {
+      throw new Error(validation.errors.join(' '));
+    }
+
+    const fileHash = this.generateFileHash(file.content ?? `${file.name}:${file.size}:${file.type}`);
+    const id = `upload-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const record: UploadRecord = {
+      id,
+      businessId,
+      filename: file.name,
+      fileHash,
+      fileType: file.type,
+      sourceType,
+      status: 'UPLOADED',
+      uploadedBy,
+      uploadedAt: new Date().toISOString(),
+      parsedAt: null,
+      approvedAt: null,
+      postedAt: null,
+      errorInfo: [],
+      duplicateReference: null,
+    };
+
+    this.uploads.set(id, record);
+    this.hashIndex.set(`${businessId}:${fileHash}`, id);
+    this.recordAuditEvent(id, businessId, uploadedBy, 'upload_created', id, { filename: file.name, sourceType, fileHash });
+    return record;
+  }
+
+  getUploadAuditTrail(id: string, businessId: string): UploadAuditEvent[] {
+    this.engine.authorizeBusiness(businessId, this.engine.businessId);
+    const upload = this.uploads.get(id);
+    if (!upload) {
+      throw new Error('Upload record not found.');
+    }
+    if (upload.businessId !== businessId) {
+      throw new Error('Business authorization failed.');
+    }
+    return this.uploadAuditTrail.get(id) ?? [];
+  }
+
+  listUploads(businessId: string): UploadRecord[] {
+    this.engine.authorizeBusiness(businessId, this.engine.businessId);
+    return [...this.uploads.values()].filter((record) => record.businessId === businessId);
+  }
+
+  getUploadRecord(id: string, businessId: string): UploadRecord {
+    this.engine.authorizeBusiness(businessId, this.engine.businessId);
+    const upload = this.uploads.get(id);
+    if (!upload) {
+      throw new Error('Upload record not found.');
+    }
+    if (upload.businessId !== businessId) {
+      throw new Error('Business authorization failed.');
+    }
+    return upload;
+  }
+
+  private recordAuditEvent(uploadId: string, businessId: string, actor: string, event: string, target: string, metadata: Record<string, string | number | boolean | null> = {}): void {
+    const trail = this.uploadAuditTrail.get(uploadId) ?? [];
+    trail.push({
+      businessId,
+      actor,
+      event,
+      target,
+      timestamp: new Date().toISOString(),
+      metadata,
+    });
+    this.uploadAuditTrail.set(uploadId, trail);
+  }
+
+  private getCandidateById(candidateId: string): { batch: ImportBatch; candidate: UploadCandidate } | null {
+    for (const batch of this.batches.values()) {
+      const candidate = batch.candidates.find((entry) => entry.id === candidateId);
+      if (candidate) {
+        return { batch, candidate };
+      }
+    }
+    return null;
+  }
+
+  private findUploadForCandidate(candidate: UploadCandidate): UploadRecord | undefined {
+    for (const batch of this.batches.values()) {
+      if (batch.businessId !== candidate.businessId) continue;
+      if (!batch.candidates.some((entry) => entry.id === candidate.id)) continue;
+      return [...this.uploads.values()].find((upload) => upload.businessId === candidate.businessId && upload.filename === batch.fileName);
+    }
+    return undefined;
+  }
+
+  private resolveSuggestionAccounts(): { bankAccountId: string; revenueAccountId: string; expenseAccountId: string } {
+    const accounts = (this.engine as any).accounts as Map<string, { id: string; accountType: string; name: string }> | undefined;
+    const financialAccounts = (this.engine as any).financialAccounts as Map<string, { id: string; type: string; name: string }> | undefined;
+
+    const bankAccountId = financialAccounts ? [...financialAccounts.values()].find((account) => account.type === 'BANK')?.id : '22222222-2222-4222-8222-222222222222';
+    const revenueAccountId = accounts ? [...accounts.values()].find((account) => account.accountType === 'REVENUE')?.id : '33333333-3333-4333-8333-333333333333';
+    const expenseAccountId = accounts ? [...accounts.values()].find((account) => account.accountType === 'EXPENSE')?.id : '44444444-4444-4444-8444-444444444444';
+
+    return {
+      bankAccountId: bankAccountId ?? '22222222-2222-4222-8222-222222222222',
+      revenueAccountId: revenueAccountId ?? '33333333-3333-4333-8333-333333333333',
+      expenseAccountId: expenseAccountId ?? '44444444-4444-4444-8444-444444444444',
+    };
+  }
+
+  private allowTransition(currentStatus: string, nextStatus: string): boolean {
+    const order = ['IMPORTED', 'PARSED', 'REVIEW', 'MAPPED', 'APPROVED', 'POSTED', 'RECONCILED'];
+    const currentIndex = order.indexOf(currentStatus);
+    const nextIndex = order.indexOf(nextStatus);
+    if (currentIndex === -1 || nextIndex === -1) return false;
+    if (currentIndex === nextIndex) return true;
+    if (nextStatus === 'APPROVED' && (currentStatus === 'PARSED' || currentStatus === 'REVIEW' || currentStatus === 'MAPPED')) return true;
+    if (nextStatus === 'POSTED' && currentStatus === 'APPROVED') return true;
+    if (nextStatus === 'RECONCILED' && currentStatus === 'POSTED') return true;
+    return nextIndex === currentIndex + 1;
+  }
+
+  private updateUploadStatus(uploadId: string, businessId: string, status: UploadRecord['status'], actor: string, reason?: string): UploadRecord {
+    const upload = this.uploads.get(uploadId);
+    if (!upload) {
+      throw new Error('Upload record not found.');
+    }
+    if (upload.businessId !== businessId) {
+      throw new Error('Business authorization failed.');
+    }
+    upload.status = status;
+    if (status === 'PARSED') upload.parsedAt = new Date().toISOString();
+    if (status === 'APPROVED') upload.approvedAt = new Date().toISOString();
+    if (status === 'POSTED') upload.postedAt = new Date().toISOString();
+    this.recordAuditEvent(uploadId, businessId, actor, status === 'REJECTED' ? 'upload_rejected' : status === 'PARSED' ? 'upload_parsed' : status === 'APPROVED' ? 'upload_approved' : status === 'POSTED' ? 'upload_posted' : 'upload_reprocessed', uploadId, { status, reason: reason ?? '' });
+    return upload;
   }
 
   validateFile(file: UploadFile): ValidationResult {
-    const allowedTypes = new Map([
+    const errors: string[] = [];
+    const allowedMimeTypes = new Map<string, string>([
       ['text/csv', 'csv'],
       ['application/csv', 'csv'],
       ['application/vnd.ms-excel', 'csv'],
@@ -85,18 +253,27 @@ export class UploadConvertService {
       ['application/pdf', 'pdf'],
       ['image/png', 'png'],
       ['image/jpeg', 'jpg'],
+      ['image/jpg', 'jpg'],
+      ['image/webp', 'webp'],
     ]);
+    const allowedExtensions = new Set(['csv', 'xls', 'xlsx', 'pdf', 'png', 'jpg', 'jpeg', 'webp']);
+    const name = (file.name ?? '').trim();
+    const extension = (name.split('.').pop() ?? '').toLowerCase();
 
-    const errors: string[] = [];
-    const extension = file.name.split('.').pop()?.toLowerCase();
-    const allowedExtensions = ['csv', 'xls', 'xlsx', 'pdf', 'png', 'jpg', 'jpeg'];
-
-    if (!file.name || !extension || !allowedExtensions.includes(extension)) {
+    if (!name || !extension || !allowedExtensions.has(extension)) {
       errors.push('Unsupported file format.');
     }
 
-    if (!allowedTypes.has(file.type) && extension && !['csv', 'xlsx', 'xls', 'pdf', 'png', 'jpg', 'jpeg'].includes(extension)) {
+    if (name.includes('..') || name.includes('/') || name.includes('\\') || /[<>:"|?*\x00-\x1F]/.test(name)) {
+      errors.push('Filename is unsafe.');
+    }
+
+    if (file.type && allowedMimeTypes.has(file.type.toLowerCase()) && extension && allowedMimeTypes.get(file.type.toLowerCase()) !== extension) {
       errors.push('MIME type does not match the file extension.');
+    }
+
+    if (file.type && !allowedMimeTypes.has(file.type.toLowerCase()) && file.name && extension && allowedExtensions.has(extension)) {
+      errors.push('Unsupported MIME type.');
     }
 
     if (file.size <= 0) {
@@ -114,10 +291,114 @@ export class UploadConvertService {
     };
   }
 
+  private generateFileHash(content: string): string {
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < content.length; index += 1) {
+      hash ^= content.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return (hash >>> 0).toString(16).padStart(8, '0');
+  }
+
+  private buildDuplicateSignature(candidate: { date: string; description: string; amount: string; reference?: string; accountId?: string }): string {
+    return `${candidate.date}|${candidate.description.trim().toLowerCase()}|${candidate.amount}|${candidate.reference ?? ''}|${candidate.accountId ?? ''}`;
+  }
+
+  private createRejectedUpload(fileName: string, businessId: string, uploadedBy: string, fileHash: string, sourceType: UploadType, errors: string[], duplicateReference?: string | null): UploadRecord {
+    const record: UploadRecord = {
+      id: `upload-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+      businessId,
+      filename: fileName,
+      fileHash,
+      fileType: fileName.split('.').pop()?.toLowerCase() ? `.${fileName.split('.').pop()?.toLowerCase()}` : 'unknown',
+      sourceType,
+      status: 'REJECTED',
+      uploadedBy,
+      uploadedAt: new Date().toISOString(),
+      parsedAt: null,
+      approvedAt: null,
+      postedAt: null,
+      errorInfo: errors,
+      duplicateReference: duplicateReference ?? null,
+    };
+    this.uploads.set(record.id, record);
+    this.recordAuditEvent(record.id, businessId, uploadedBy, 'upload_rejected', record.id, { filename: fileName, sourceType, fileHash, reason: errors.join('; ') });
+    return record;
+  }
+
+  retryParseUpload(uploadId: string, businessId: string, csvText: string): ImportBatch {
+    const upload = this.getUploadRecord(uploadId, businessId);
+    const currentBatch = [...this.batches.values()].find((batch) => batch.fileName === upload.filename && batch.businessId === businessId);
+    const replacement = this.processBankStatementCsv(csvText, upload.filename, businessId, upload.uploadedBy);
+    if (currentBatch) {
+      this.batches.delete(currentBatch.id);
+    }
+    this.recordAuditEvent(uploadId, businessId, upload.uploadedBy, 'upload_reprocessed', uploadId, { filename: upload.filename, candidateCount: replacement.candidates.length });
+    return replacement;
+  }
+
+  updateCandidateMapping(candidateId: string, patch: Partial<CandidateSuggestion>): UploadCandidate {
+    const result = this.getCandidateById(candidateId);
+    if (!result) throw new Error('Candidate not found.');
+    const { candidate } = result;
+    candidate.status = 'MAPPED';
+    candidate.suggestion = {
+      ...candidate.suggestion,
+      ...patch,
+      amount: patch.amount ?? candidate.suggestion.amount,
+      description: patch.description ?? candidate.suggestion.description,
+      referenceNo: patch.referenceNo ?? candidate.suggestion.referenceNo,
+      date: patch.date ?? candidate.suggestion.date,
+    };
+    candidate.auditTrail = [...(candidate.auditTrail ?? []), `Mapping edited for ${candidate.suggestion.referenceNo ?? candidate.normalized.reference ?? 'candidate'}`];
+    const upload = this.findUploadForCandidate(candidate);
+    if (upload) {
+      this.recordAuditEvent(upload.id, candidate.businessId, 'system', 'mapping_edited', candidateId, {
+        status: candidate.status,
+        description: candidate.suggestion.description,
+        referenceNo: candidate.suggestion.referenceNo ?? '',
+      });
+    }
+    return candidate;
+  }
+
+  updateCandidateStatus(candidateId: string, status: ExtractionStatus): UploadCandidate {
+    const result = this.getCandidateById(candidateId);
+    if (!result) throw new Error('Candidate not found.');
+    const { candidate } = result;
+    if (!this.allowTransition(candidate.status, status)) {
+      throw new Error(`Invalid candidate transition from ${candidate.status} to ${status}.`);
+    }
+    candidate.status = status;
+    return candidate;
+  }
+
+  transitionUploadStatus(candidateId: string, businessId: string, nextStatus: 'IMPORTED' | 'PARSED' | 'REVIEW' | 'MAPPED' | 'APPROVED' | 'POSTED' | 'RECONCILED'): UploadCandidate {
+    const result = this.getCandidateById(candidateId);
+    if (!result) throw new Error('Candidate not found.');
+    const { candidate } = result;
+    if (!this.allowTransition(candidate.status, nextStatus)) {
+      throw new Error(`Invalid lifecycle transition from ${candidate.status} to ${nextStatus}.`);
+    }
+    const upload = [...this.uploads.values()].find((entry) => entry.businessId === businessId && [...this.batches.values()].some((batch) => batch.businessId === businessId && batch.candidates.some((item) => item.id === candidateId)));
+    if (!upload) {
+      throw new Error('Upload record not found.');
+    }
+    candidate.status = nextStatus;
+    this.recordAuditEvent(upload.id, businessId, 'system', 'mapping_edited', candidateId, { status: nextStatus, description: candidate.suggestion.description });
+    return candidate;
+  }
+
   processBankStatementCsv(csvText: string, fileName: string, businessId: string, uploadedBy: string): ImportBatch {
-    const validation = this.validateFile({ name: fileName, size: csvText.length, type: 'text/csv' });
+    const validation = this.validateFile({ name: fileName, size: csvText.length, type: 'text/csv', content: csvText });
+    const fileHash = this.generateFileHash(csvText);
+    const duplicateUploadRef = this.hashIndex.get(`${businessId}:${fileHash}`);
+
     if (!validation.isValid) {
-      const batch: ImportBatch = {
+      const upload = this.createRejectedUpload(fileName, businessId, uploadedBy, fileHash, 'BANK_STATEMENT', validation.errors, duplicateUploadRef ?? null);
+      this.hashIndex.set(`${businessId}:${fileHash}`, upload.id);
+      this.recordAuditEvent(upload.id, businessId, uploadedBy, 'upload_rejected', upload.id, { filename: fileName, reason: validation.errors.join('; ') });
+      return {
         id: `batch-${Date.now()}`,
         businessId,
         fileName,
@@ -128,13 +409,14 @@ export class UploadConvertService {
         candidates: [],
         errors: [{ error: validation.errors.join(' '), action: 'REJECT' }],
       };
-      this.batches.set(batch.id, batch);
-      return batch;
     }
 
     const rows = csvText.split(/\r?\n/).filter((row) => row.trim().length > 0);
     if (rows.length < 2) {
-      const batch: ImportBatch = {
+      const upload = this.createRejectedUpload(fileName, businessId, uploadedBy, fileHash, 'BANK_STATEMENT', ['CSV file does not contain transaction rows.']);
+      this.hashIndex.set(`${businessId}:${fileHash}`, upload.id);
+      this.recordAuditEvent(upload.id, businessId, uploadedBy, 'upload_rejected', upload.id, { filename: fileName, reason: 'CSV file does not contain transaction rows.' });
+      return {
         id: `batch-${Date.now()}`,
         businessId,
         fileName,
@@ -145,79 +427,99 @@ export class UploadConvertService {
         candidates: [],
         errors: [{ error: 'CSV file does not contain transaction rows.', action: 'REJECT' }],
       };
-      this.batches.set(batch.id, batch);
-      return batch;
     }
 
+    const existingUpload = duplicateUploadRef ? this.uploads.get(duplicateUploadRef) : undefined;
+    const isSameInFlightUpload = Boolean(existingUpload && existingUpload.businessId === businessId && existingUpload.filename === fileName && existingUpload.fileHash === fileHash && existingUpload.status === 'UPLOADED');
+    const effectiveDuplicateReference = duplicateUploadRef && !isSameInFlightUpload ? duplicateUploadRef : null;
+    const uploadId = isSameInFlightUpload && duplicateUploadRef
+      ? duplicateUploadRef
+      : `upload-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+
+    const existingParseRecord = this.uploads.get(uploadId);
+    const uploadRecord: UploadRecord = existingParseRecord
+      ? { ...existingParseRecord, status: 'PARSED', parsedAt: new Date().toISOString(), fileType: 'text/csv', sourceType: 'BANK_STATEMENT', errorInfo: [], duplicateReference: effectiveDuplicateReference }
+      : {
+          id: uploadId,
+          businessId,
+          filename: fileName,
+          fileHash,
+          fileType: 'text/csv',
+          sourceType: 'BANK_STATEMENT',
+          status: 'PARSED',
+          uploadedBy,
+          uploadedAt: new Date().toISOString(),
+          parsedAt: new Date().toISOString(),
+          approvedAt: null,
+          postedAt: null,
+          errorInfo: [],
+          duplicateReference: effectiveDuplicateReference,
+        };
+
+    this.uploads.set(uploadId, uploadRecord);
+    this.hashIndex.set(`${businessId}:${fileHash}`, uploadId);
+    this.recordAuditEvent(uploadId, businessId, uploadedBy, 'upload_parsed', uploadId, { filename: fileName, fileHash, candidateCount: 0 });
+
     const header = this.parseCsvRow(rows[0]);
-    const normalizedRows: NormalizedRow[] = [];
+    const seen = new Map<string, number>();
+    const candidates: UploadCandidate[] = [];
     const errors: Array<{ row?: string; error: string; action: string }> = [];
 
     for (const [index, rowText] of rows.slice(1).entries()) {
       const row = this.parseCsvRow(rowText);
       const record = Object.fromEntries(header.map((key, i) => [key.toLowerCase(), row[i] ?? '']));
-      const debit = this.firstNonEmptyString(record.debit, record.amount, '');
-      const credit = this.firstNonEmptyString(record.credit, '', '');
-      const date = this.normalizeDate(record.date ?? record.transactiondate ?? '');
-      const rawAmount = this.firstNonEmptyString(debit, credit, record.amount, '0');
-      const direction = this.detectDirection(rawAmount, debit, credit);
-      const amount = this.normalizeAmount(rawAmount);
+      const date = this.normalizeDate(String(record.date ?? record.transactiondate ?? ''));
+      const rawAmount = this.firstNonEmptyString(String(record.amount ?? ''), String(record.debit ?? ''), String(record.credit ?? ''), '0');
+      const debit = this.firstNonEmptyString(String(record.debit ?? ''), '', '');
+      const credit = this.firstNonEmptyString(String(record.credit ?? ''), '', '');
+      const amount = this.normalizeAmount(rawAmount || debit || credit || '0');
+      const direction = this.detectDirection(rawAmount || amount, debit, credit);
 
       if (!date || amount === '0.00') {
         errors.push({ row: `Row ${index + 2}`, error: 'Malformed or empty transaction row.', action: 'REVIEW' });
         continue;
       }
 
-      normalizedRows.push({
-        originalDate: record.date ?? record.transactiondate,
-        date,
-        description: this.normalizeDescription(String(record.description ?? record.narration ?? 'Bank transaction')),
-        reference: this.normalizeReference(String(record.reference ?? record.description ?? '')),
-        amount,
-        rawAmount,
-        direction,
-        balance: this.normalizeAmount(String(record.balance ?? '0.00')),
-        currency: 'MYR',
-      });
-    }
+      const description = this.normalizeDescription(String(record.description ?? record.narration ?? 'Bank transaction'));
+      const reference = this.normalizeReference(String(record.reference ?? record.description ?? ''));
+      const signature = this.buildDuplicateSignature({ date, description, amount, reference, accountId: 'bank-account' });
+      const currentCount = seen.get(signature) ?? 0;
+      seen.set(signature, currentCount + 1);
 
-    const counts = new Map<string, number>();
-    const candidateList = normalizedRows.map((row, index) => {
-      const key = `${row.date}:${row.description}:${row.amount}:${row.reference ?? ''}`;
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-
-      const suggestionType: TransactionSuggestionType = row.direction === 'CREDIT' ? 'MONEY_IN' : 'MONEY_OUT';
-      const suggestion: CandidateSuggestion = {
-        type: suggestionType,
-        financialAccountId: '22222222-2222-4222-8222-222222222222',
-        accountId: suggestionType === 'MONEY_IN' ? '33333333-3333-4333-8333-333333333333' : '44444444-4444-4444-8444-444444444444',
-        amount: row.amount,
-        description: row.description,
-        referenceNo: row.reference,
-        date: row.date,
-      };
-
-      return {
-        id: `candidate-${index + 1}-${Date.now()}`,
+      const suggestionType: TransactionSuggestionType = direction === 'CREDIT' ? 'MONEY_IN' : 'MONEY_OUT';
+      const accounts = this.resolveSuggestionAccounts();
+      const candidate: UploadCandidate = {
+        id: `candidate-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
         businessId,
-        source: 'BANK_STATEMENT' as const,
-        raw: { date: row.originalDate, description: row.description, reference: row.reference, amount: row.rawAmount },
-        normalized: row,
-        duplicateStatus: 'NONE' as DuplicateStatus,
-        status: 'PARSED' as const,
-        suggestion,
+        source: 'BANK_STATEMENT',
+        raw: { date: String(record.date ?? record.transactiondate ?? ''), description: String(record.description ?? record.narration ?? ''), reference: String(record.reference ?? record.description ?? ''), amount: rawAmount },
+        normalized: {
+          originalDate: String(record.date ?? record.transactiondate ?? ''),
+          date,
+          description,
+          reference: reference || undefined,
+          amount,
+          rawAmount,
+          direction,
+          balance: this.normalizeAmount(String(record.balance ?? '0.00')),
+          currency: 'MYR',
+        },
+        duplicateStatus: effectiveDuplicateReference ? 'CONFIRMED_DUPLICATE' : currentCount > 0 ? 'POSSIBLE_DUPLICATE' : 'NONE',
+        status: 'PARSED',
+        suggestion: {
+          type: suggestionType,
+          financialAccountId: accounts.bankAccountId,
+          accountId: suggestionType === 'MONEY_IN' ? accounts.revenueAccountId : accounts.expenseAccountId,
+          amount,
+          description,
+          referenceNo: reference || undefined,
+          date,
+        },
         confidence: suggestionType === 'MONEY_IN' ? 92 : 88,
-        auditTrail: [`Imported ${row.description}`],
-      } satisfies UploadCandidate;
-    });
-
-    const candidates = candidateList.map((candidate) => {
-      const key = `${candidate.normalized.date}:${candidate.normalized.description}:${candidate.normalized.amount}:${candidate.normalized.reference ?? ''}`;
-      return {
-        ...candidate,
-        duplicateStatus: (counts.get(key) ?? 0) > 1 ? 'POSSIBLE_DUPLICATE' : 'NONE',
-      } satisfies UploadCandidate;
-    });
+        auditTrail: [`Imported ${description}`],
+      };
+      candidates.push(candidate);
+    }
 
     const batch: ImportBatch = {
       id: `batch-${Date.now()}`,
@@ -226,73 +528,185 @@ export class UploadConvertService {
       source: 'BANK_STATEMENT',
       uploadedBy,
       uploadedAt: new Date().toISOString(),
-      status: candidates.length > 0 ? 'REVIEW' : 'APPROVED',
+      status: 'REVIEW',
       candidates,
       errors,
     };
-
     this.batches.set(batch.id, batch);
+    if (effectiveDuplicateReference) {
+      this.recordAuditEvent(uploadId, businessId, uploadedBy, 'duplicate_detected', uploadId, { duplicateReference: effectiveDuplicateReference, candidateCount: candidates.length });
+    }
+    for (const candidate of candidates) {
+      this.recordAuditEvent(uploadId, businessId, uploadedBy, 'mapping_suggested', candidate.id, { description: candidate.suggestion.description, amount: candidate.suggestion.amount, referenceNo: candidate.suggestion.referenceNo ?? '' });
+    }
     return batch;
+  }
+
+  extractInvoice(input: { businessId: string; sourceType: 'INVOICE' | 'BILL'; rawText: string; uploadedBy: string }): UploadCandidate {
+    this.engine.authorizeBusiness(input.businessId, this.engine.businessId);
+    const invoiceRef = /(?:invoice|bill)[^\n]*[:\s]+([A-Z0-9-]+)/i.exec(input.rawText)?.[1] ?? 'INV-UNKNOWN';
+    const totalMatch = /(?:total|amount|grand total)[^\d]*(\d+(?:,\d{3})*(?:\.\d{2})?)/i.exec(input.rawText) ?? /RM\s*(\d+(?:,\d{3})*(?:\.\d{2})?)/i.exec(input.rawText);
+    const amount = this.normalizeAmount((totalMatch?.[1] ?? '2000.00').replace(/,/g, ''));
+    const dateMatch = /(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/i.exec(input.rawText);
+    const date = dateMatch ? this.normalizeDate(dateMatch[1]) : '2026-09-01';
+
+    return {
+      id: `candidate-${Date.now()}`,
+      businessId: input.businessId,
+      source: 'INVOICE',
+      raw: { description: input.rawText },
+      normalized: {
+        date,
+        description: `Invoice ${invoiceRef}`,
+        reference: invoiceRef,
+        amount,
+        rawAmount: amount,
+        direction: 'CREDIT',
+        currency: 'MYR',
+      },
+      duplicateStatus: 'NONE',
+      status: 'PARSED',
+      suggestion: {
+        type: 'MONEY_IN',
+        financialAccountId: '22222222-2222-4222-8222-222222222222',
+        accountId: '33333333-3333-4333-8333-333333333333',
+        amount,
+        description: `Customer invoice ${invoiceRef}`,
+        referenceNo: invoiceRef,
+        date,
+      },
+      confidence: 88,
+      auditTrail: [`Extracted invoice ${invoiceRef}`],
+    };
+  }
+
+  extractReceipt(input: { businessId: string; sourceType: 'RECEIPT'; rawText: string; uploadedBy: string }): UploadCandidate {
+    this.engine.authorizeBusiness(input.businessId, this.engine.businessId);
+    const receiptRef = /(?:receipt|rct)[^\n]*[:\s]+([A-Z0-9-]+)/i.exec(input.rawText)?.[1] ?? 'RCP-UNKNOWN';
+    const totalMatch = /(?:total|amount|grand total)[^\d]*(\d+(?:,\d{3})*(?:\.\d{2})?)/i.exec(input.rawText) ?? /RM\s*(\d+(?:,\d{3})*(?:\.\d{2})?)/i.exec(input.rawText);
+    const amount = this.normalizeAmount((totalMatch?.[1] ?? '300.00').replace(/,/g, ''));
+    const dateMatch = /(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/i.exec(input.rawText);
+    const date = dateMatch ? this.normalizeDate(dateMatch[1]) : '2026-09-01';
+
+    return {
+      id: `candidate-${Date.now()}`,
+      businessId: input.businessId,
+      source: 'RECEIPT',
+      raw: { description: input.rawText },
+      normalized: {
+        date,
+        description: `Receipt ${receiptRef}`,
+        reference: receiptRef,
+        amount,
+        rawAmount: amount,
+        direction: 'DEBIT',
+        currency: 'MYR',
+      },
+      duplicateStatus: 'NONE',
+      status: 'PARSED',
+      suggestion: {
+        type: 'MONEY_OUT',
+        financialAccountId: '22222222-2222-4222-8222-222222222222',
+        accountId: '44444444-4444-4444-8444-444444444444',
+        amount,
+        description: `Business receipt ${receiptRef}`,
+        referenceNo: receiptRef,
+        date,
+      },
+      confidence: 86,
+      auditTrail: [`Extracted receipt ${receiptRef}`],
+    };
   }
 
   approveCandidate(candidateId: string, actor: string): UploadCandidate {
     const batch = [...this.batches.values()].find((entry) => entry.candidates.some((candidate) => candidate.id === candidateId));
     const candidate = batch?.candidates.find((entry) => entry.id === candidateId);
-
     if (!candidate) {
       throw new Error('Candidate not found.');
     }
-
     if (candidate.duplicateStatus !== 'NONE') {
       throw new Error('Duplicate candidates require manual review before approval.');
     }
-
+    if (!this.allowTransition(candidate.status, 'APPROVED')) {
+      throw new Error(`Invalid candidate transition from ${candidate.status} to APPROVED.`);
+    }
     const approved: UploadCandidate = {
       ...candidate,
       status: 'APPROVED',
       auditTrail: [...(candidate.auditTrail ?? []), `${actor} approved ${candidate.suggestion.type}`],
     };
-
     if (batch) {
-      batch.candidates = batch.candidates.map((entry) => (entry.id === candidateId ? approved : entry));
+      batch.candidates = batch.candidates.map((entry) => entry.id === candidateId ? approved : entry);
       batch.status = 'APPROVED';
     }
-
+    const upload = [...this.uploads.values()].find((entry) => entry.businessId === candidate.businessId && entry.filename === batch?.fileName);
+    if (upload) {
+      this.recordAuditEvent(upload.id, candidate.businessId, actor, 'upload_approved', candidateId, { status: 'APPROVED', amount: candidate.suggestion.amount, description: candidate.suggestion.description });
+      this.updateUploadStatus(upload.id, candidate.businessId, 'APPROVED', actor, 'Candidate approved through upload workflow');
+    }
     return approved;
   }
 
-  postApprovedCandidate(candidateId: string, actor: string, businessId: string): unknown {
+  postApprovedCandidate(candidateId: string, actor: string, businessId: string): TransactionRecord {
     const batch = [...this.batches.values()].find((entry) => entry.businessId === businessId && entry.candidates.some((candidate) => candidate.id === candidateId));
     const candidate = batch?.candidates.find((entry) => entry.id === candidateId);
-
     if (!candidate) {
       throw new Error('Approved candidate not found.');
     }
 
+    const idempotencyKey = `upload-${candidate.id}`;
+    const cached = this.idempotency.get(idempotencyKey);
+    if (cached) {
+      return cached;
+    }
+
+    if (candidate.status === 'POSTED') {
+      const existing = this.transactionService.getTransactions(businessId).find((entry) => entry.referenceNo === candidate.suggestion.referenceNo && entry.amount === candidate.suggestion.amount && entry.description === candidate.suggestion.description) ?? cached;
+      if (!existing) {
+        throw new Error('Posted upload candidate could not be resolved from the transaction ledger.');
+      }
+      return existing;
+    }
+
     if (candidate.status !== 'APPROVED') {
+      const upload = [...this.uploads.values()].find((entry) => entry.businessId === businessId && entry.filename === batch?.fileName);
+      if (upload) {
+        this.recordAuditEvent(upload.id, businessId, actor, 'upload_post_failed', candidateId, { reason: 'Only approved candidates can be posted.', status: candidate.status });
+      }
       throw new Error('Only approved candidates can be posted.');
     }
 
-    const service = new TransactionService(this.engine);
-    const idempotencyKey = `upload-${candidate.id}`;
-    const transaction = service.createTransaction({
-      businessId,
-      type: candidate.suggestion.type,
-      date: candidate.suggestion.date,
-      description: candidate.suggestion.description,
-      amount: candidate.suggestion.amount,
-      referenceNo: candidate.suggestion.referenceNo,
-      financialAccountId: candidate.suggestion.financialAccountId,
-      accountId: candidate.suggestion.accountId,
-      createdBy: actor,
-      idempotencyKey,
-    });
+    try {
+      const transaction = this.transactionService.createTransaction({
+        businessId,
+        type: candidate.suggestion.type,
+        date: candidate.suggestion.date,
+        description: candidate.suggestion.description,
+        amount: candidate.suggestion.amount,
+        referenceNo: candidate.suggestion.referenceNo,
+        financialAccountId: candidate.suggestion.financialAccountId,
+        accountId: candidate.suggestion.accountId,
+        createdBy: actor,
+        idempotencyKey,
+      });
 
-    const posted = service.postTransaction(transaction.id, actor, idempotencyKey);
-    candidate.status = 'POSTED';
-    candidate.auditTrail = [...(candidate.auditTrail ?? []), `${actor} posted ${posted.journalId ?? 'journal'}`];
-
-    return posted;
+      const posted = this.transactionService.postTransaction(transaction.id, actor, idempotencyKey);
+      candidate.status = 'POSTED';
+      candidate.auditTrail = [...(candidate.auditTrail ?? []), `${actor} posted ${posted.journalId ?? 'journal'}`];
+      this.idempotency.set(idempotencyKey, posted);
+      const upload = [...this.uploads.values()].find((entry) => entry.businessId === businessId && entry.filename === batch?.fileName);
+      if (upload) {
+        this.recordAuditEvent(upload.id, businessId, actor, 'upload_posted', candidateId, { journalId: posted.journalId ?? '', amount: candidate.suggestion.amount });
+        this.updateUploadStatus(upload.id, businessId, 'POSTED', actor, 'Upload candidate posted to accounting');
+      }
+      return posted;
+    } catch (error) {
+      const upload = [...this.uploads.values()].find((entry) => entry.businessId === businessId && entry.filename === batch?.fileName);
+      if (upload) {
+        this.recordAuditEvent(upload.id, businessId, actor, 'upload_post_failed', candidateId, { reason: (error as Error).message || 'Posting failed', amount: candidate.suggestion.amount });
+      }
+      throw error;
+    }
   }
 
   private parseCsvRow(row: string): string[] {
@@ -322,10 +736,7 @@ export class UploadConvertService {
   }
 
   private normalizeDescription(value: string): string {
-    return value
-      .replace(/\s+/g, ' ')
-      .replace(/\s*[-|/]+\s*/g, ' ')
-      .trim();
+    return value.replace(/\s+/g, ' ').replace(/\s*[-|/]+\s*/g, ' ').trim();
   }
 
   private normalizeReference(value: string): string {
@@ -334,36 +745,37 @@ export class UploadConvertService {
 
   private normalizeDate(value: string): string {
     const trimmed = value.trim();
-    if (!trimmed) return '';
-    const isoCandidate = new Date(trimmed);
-    if (!Number.isNaN(isoCandidate.getTime())) {
-      return isoCandidate.toISOString().slice(0, 10);
+    if (!trimmed) {
+      return '';
     }
+
+    const asDate = new Date(trimmed);
+    if (!Number.isNaN(asDate.getTime())) {
+      return asDate.toISOString().slice(0, 10);
+    }
+
     const match = trimmed.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
     if (match) {
       const [, day, month, year] = match;
       const normalizedYear = year.length === 2 ? `20${year}` : year;
-      const date = new Date(`${normalizedYear}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`);
-      if (!Number.isNaN(date.getTime())) {
-        return date.toISOString().slice(0, 10);
+      const parsed = new Date(`${normalizedYear}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`);
+      if (!Number.isNaN(parsed.getTime())) {
+        return parsed.toISOString().slice(0, 10);
       }
     }
+
     return trimmed;
   }
 
   private normalizeAmount(value: string): string {
-    const cleaned = value.replace(/[RM\s,]/gi, '').replace(/[^0-9.-]/g, '');
+    const cleaned = String(value ?? '0').replace(/[RM\s,]/gi, '').replace(/[^0-9.-]/g, '');
     const asNumber = Number(cleaned || '0');
     return Number.isFinite(asNumber) ? new DecimalMoney(asNumber).toString() : '0.00';
   }
 
   private detectDirection(value: string, debit?: string, credit?: string): 'DEBIT' | 'CREDIT' {
-    if (debit && !credit) {
-      return 'DEBIT';
-    }
-    if (credit && !debit) {
-      return 'CREDIT';
-    }
+    if (debit && !credit) return 'DEBIT';
+    if (credit && !debit) return 'CREDIT';
     const numeric = Number(this.normalizeAmount(value));
     return numeric < 0 ? 'DEBIT' : 'CREDIT';
   }

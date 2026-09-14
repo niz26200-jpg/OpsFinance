@@ -14,18 +14,18 @@ test.describe(E2E_ENVIRONMENT, () => {
 
   test('business access and settings navigation are available in the mock environment', async ({ page }) => {
     await page.goto('/');
-    await page.getByRole('link', { name: 'Settings' }).click();
+    await page.getByRole('link', { name: 'Settings', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
-    await page.getByRole('link', { name: 'Subscription' }).click();
+    await page.getByRole('link', { name: 'Subscription', exact: true }).click();
     await expect(page.getByRole('heading', { name: /OpsFinance current plan/i })).toBeVisible();
   });
 
   test('money in, money out, transfer, upload, reconciliation, and reports screens load', async ({ page }) => {
     await page.goto('/transactions');
     await expect(page.getByText('All Transactions')).toBeVisible();
-    await expect(page.getByText('Money In')).toBeVisible();
-    await expect(page.getByText('Money Out')).toBeVisible();
-    await expect(page.getByText('Transfer')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Money In', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Money Out', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Transfer', exact: true })).toBeVisible();
 
     await page.goto('/upload');
     await expect(page.getByRole('heading', { name: 'Upload & Convert' })).toBeVisible();

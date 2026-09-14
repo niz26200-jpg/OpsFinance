@@ -334,6 +334,16 @@ export class AccountingEngine {
     return new DecimalMoney(value);
   }
 
+  private assertBusinessOwnedLedgerAccount(businessId: string, accountId: string): void {
+    const account = this.accounts.get(accountId) ?? this.financialAccounts.get(accountId);
+    if (!account) {
+      throw new Error(`Account ${accountId} does not exist.`);
+    }
+    if (account.businessId !== businessId) {
+      throw new Error(`Account ${accountId} does not belong to this business.`);
+    }
+  }
+
   createJournal(input: JournalInput): JournalEntry {
     const journal = {
       id: `journal-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
@@ -521,6 +531,7 @@ export class AccountingEngine {
 
   getLedger(input: { businessId: string; accountId: string; startDate?: string; endDate?: string }): LedgerSnapshot {
     this.authorizeBusiness(input.businessId, this.businessId);
+    this.assertBusinessOwnedLedgerAccount(input.businessId, input.accountId);
 
     const entries: LedgerEntry[] = [];
     for (const journal of this.journals.values()) {

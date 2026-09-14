@@ -116,6 +116,13 @@ export class FinancialReportService {
     return account;
   }
 
+  private assertBusinessOwnedAccount(businessId: string, accountId: string): void {
+    const account = this.getBusinessAccounts(businessId).find((entry) => entry.id === accountId);
+    if (!account) {
+      throw new Error(`Account ${accountId} does not belong to this business.`);
+    }
+  }
+
   private isWithinDateRange(date: string, from?: string, to?: string): boolean {
     if (from && date < from) return false;
     if (to && date > to) return false;
@@ -167,6 +174,10 @@ export class FinancialReportService {
     postedStatus?: 'POSTED' | 'ALL';
   }): GeneralLedgerReport {
     this.engine.authorizeBusiness(input.businessId, this.engine.businessId);
+
+    if (input.accountId) {
+      this.assertBusinessOwnedAccount(input.businessId, input.accountId);
+    }
 
     const accounts = this.getBusinessAccounts(input.businessId).filter((account) => {
       if (input.accountType && account.accountType !== input.accountType) return false;
@@ -227,6 +238,7 @@ export class FinancialReportService {
     dateTo?: string;
   }): AccountStatementReport {
     this.engine.authorizeBusiness(input.businessId, this.engine.businessId);
+    this.assertBusinessOwnedAccount(input.businessId, input.accountId);
     const account = this.getAccount(input.businessId, input.accountId);
     const openingBalance = this.getOpeningBalance(input.businessId, input.accountId, input.dateFrom);
     let runningBalance = openingBalance;

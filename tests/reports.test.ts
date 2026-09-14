@@ -207,6 +207,15 @@ describe('Phase 6 financial reporting', () => {
     expect(() => reports.getCashFlow({ businessId: otherBusinessId })).toThrow();
   });
 
+  it('rejects cross-business account IDs in report queries', () => {
+    const engine = buildEngine();
+    const reports = new FinancialReportService(engine);
+
+    const foreignAccountId = `${bankAccountId}-foreign`;
+    expect(() => reports.getGeneralLedger({ businessId, accountId: foreignAccountId })).toThrow('does not belong to this business');
+    expect(() => reports.getAccountStatement({ businessId, accountId: foreignAccountId })).toThrow('does not belong to this business');
+  });
+
   it('uses deterministic DecimalMoney calculations and excludes unposted entries', () => {
     const engine = buildEngine();
     const reports = new FinancialReportService(engine);

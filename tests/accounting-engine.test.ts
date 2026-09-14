@@ -325,4 +325,18 @@ describe('Phase 2 accounting engine', () => {
     expect(journalRepository.getById(businessId, 'journal-10').journalNo).toBe('J-10');
     expect(() => transactionRepository.getById(otherBusinessId, 'txn-10')).toThrow('not found');
   });
+
+  it('rejects ledger queries for accounts outside the business', () => {
+    const mixedBusinessEngine = new AccountingEngine({
+      businessId,
+      accounts: [
+        { id: 'foreign-account', businessId: otherBusinessId, code: '9999', name: 'Foreign', accountType: 'ASSET', normalBalance: 'DEBIT', isSystem: false, isActive: true },
+        { id: customerBankId, businessId, code: '1100', name: 'Maybank', accountType: 'ASSET', normalBalance: 'DEBIT', isSystem: false, isActive: true },
+      ],
+      periods: [{ id: 'period-1', businessId, name: '2026-09', startDate: '2026-09-01', endDate: '2026-09-30', status: 'OPEN' }],
+      financialAccounts: [{ id: 'foreign-financial-account', businessId: otherBusinessId, name: 'Foreign Bank', type: 'BANK', accountCode: 'FOREIGN-BANK', currency: 'MYR', status: 'ACTIVE' }],
+    });
+
+    expect(() => mixedBusinessEngine.getLedger({ businessId, accountId: 'foreign-account' })).toThrow('does not belong to this business');
+  });
 });

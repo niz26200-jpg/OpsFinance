@@ -31,3 +31,6 @@ tmp/
 !.vscode/extensions.json
 !.vscode/settings.json*.tsbuildinfo
 tsconfig.tsbuildinfo
+
+# Playwright test artifacts
+test-results/

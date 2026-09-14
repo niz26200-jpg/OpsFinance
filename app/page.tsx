@@ -6,6 +6,9 @@ export default function Page() {
       <h1>OpsFinance</h1>
       <p>Authentication foundation</p>
       <ul>
+        <li><Link href="/dashboard">Dashboard</Link></li>
+        <li><Link href="/accounts">Accounts</Link></li>
+        <li><Link href="/accounts/chart">Chart of Accounts</Link></li>
         <li><Link href="/login">Login</Link></li>
         <li><Link href="/register">Register</Link></li>
         <li><Link href="/transactions">Transactions</Link></li>
@@ -13,6 +16,9 @@ export default function Page() {
         <li><Link href="/reconciliation">Bank Reconciliation</Link></li>
         <li><Link href="/reports">Financial Reports</Link></li>
         <li><Link href="/settings">Settings</Link></li>
+        <li><Link href="/settings/business">Business Profile</Link></li>
+        <li><Link href="/settings/accounting">Accounting Settings</Link></li>
+        <li><Link href="/settings/accounting-rules">Accounting Rules</Link></li>
       </ul>
     </main>
   );

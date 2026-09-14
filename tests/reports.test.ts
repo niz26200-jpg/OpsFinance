@@ -8,6 +8,7 @@ import {
   DecimalMoney,
   type JournalLineInput,
 } from '../packages/accounting';
+import { DashboardWorkflow } from '../components/dashboard-workflow';
 import { ReportsWorkflow } from '../components/reports-workflow';
 import { FinancialReportService } from '../packages/reports';
 
@@ -369,5 +370,16 @@ describe('Phase 6 financial reporting', () => {
     expect(screen.getByLabelText(/Start date/i)).toBeTruthy();
     expect(screen.getByLabelText(/End date/i)).toBeTruthy();
     expect(screen.getByLabelText(/Account/i)).toBeTruthy();
+  });
+
+  it('renders the dashboard summary using the accounting service layer', () => {
+    render(createElement(DashboardWorkflow));
+
+    expect(screen.getByText('OpsFinance Dashboard')).toBeTruthy();
+    expect(screen.getByText(/Total Cash/i)).toBeTruthy();
+    expect(screen.getByText(/Net Profit/i)).toBeTruthy();
+    expect(screen.getByText(/Sales \/ Revenue/i)).toBeTruthy();
+    expect(screen.getByText(/Expenses/i)).toBeTruthy();
+    expect(screen.getByText(/Financial Account Balances/i)).toBeTruthy();
   });
 });

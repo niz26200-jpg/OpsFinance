@@ -48,7 +48,7 @@ export class ChartOfAccountsService {
     this.engine.authorizeBusiness(businessId, this.engine.businessId);
   }
 
-  private validateParentRelationship(businessId: string, accountType: AccountType, parentId?: string | null): void {
+  private validateParentRelationship(businessId: string, accountType: AccountType, parentId?: string | null, currentId?: string | null): void {
     if (!parentId) {
       return;
     }
@@ -62,23 +62,29 @@ export class ChartOfAccountsService {
       throw new Error('Parent account does not belong to this business.');
     }
 
-    if (parent.id === parentId && parent.accountType === accountType) {
-      return;
+    if (currentId && parentId === currentId) {
+      throw new Error('Circular parent reference detected.');
     }
 
-    if (parent.accountType === accountType) {
-      return;
+    if (parent.accountType !== accountType) {
+      throw new Error('Parent relationship is invalid for this account type.');
     }
 
-    if (parent.accountType === 'ASSET' && ['ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'COGS', 'EXPENSE'].includes(accountType)) {
-      return;
+    if (currentId) {
+      let cursor: string | null = parentId;
+      const seen = new Set<string>();
+      while (cursor) {
+        if (seen.has(cursor)) {
+          break;
+        }
+        seen.add(cursor);
+        if (cursor === currentId) {
+          throw new Error('Circular parent reference detected.');
+        }
+        const ancestor = this.getBusinessAccounts(businessId).find((entry) => entry.id === cursor);
+        cursor = ancestor?.parentId ?? null;
+      }
     }
-
-    if (accountType === 'ASSET' && ['ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'COGS', 'EXPENSE'].includes(parent.accountType)) {
-      return;
-    }
-
-    throw new Error('Parent relationship is invalid for this account type.');
   }
 
   private hasPostedJournalActivity(businessId: string, accountId: string): boolean {
@@ -160,7 +166,7 @@ export class ChartOfAccountsService {
       throw new Error(`Account code ${accountCode} already exists.`);
     }
 
-    this.validateParentRelationship(input.businessId, input.accountType, input.parentId ?? null);
+    this.validateParentRelationship(input.businessId, input.accountType, input.parentId ?? null, null);
 
     const normalBalance = input.normalBalance ?? this.buildNormalBalance(input.accountType);
     const validBalance = input.accountType === 'ASSET' || input.accountType === 'EXPENSE' || input.accountType === 'COGS'
@@ -222,7 +228,11 @@ export class ChartOfAccountsService {
     }
 
     if (nextParentId && nextParentId !== target.parentId) {
-      this.validateParentRelationship(input.businessId, nextType, nextParentId);
+      this.validateParentRelationship(input.businessId, nextType, nextParentId, target.id);
+    }
+
+    if (nextParentId === target.id) {
+      throw new Error('Circular parent reference detected.');
     }
 
     const isAssetLike = nextType === 'ASSET' || nextType === 'EXPENSE' || nextType === 'COGS';

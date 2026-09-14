@@ -45,10 +45,17 @@ export class FinancialAccountService {
   }
 
   private getAccountById(businessId: string, accountId: string): BusinessAccount {
-    const account = this.getBusinessAccounts().find((entry) => entry.id === accountId && entry.businessId === businessId);
+    const allAccounts = [...((this.engine as any).accounts as Map<string, BusinessAccount>).values()];
+    const account = allAccounts.find((entry) => entry.id === accountId);
+
     if (!account) {
       throw new Error('COA mapping not found for this business.');
     }
+
+    if (account.businessId !== businessId) {
+      throw new Error('COA mapping does not belong to this business.');
+    }
+
     return account;
   }
 

@@ -75,4 +75,32 @@ describe('financial account service', () => {
 
     expect(() => service.updateFinancialAccount({ businessId, id: created.id, accountId: accountB })).toThrow('cannot be changed');
   });
+
+  it('rejects account mappings that do not belong to the same business', () => {
+    const businessId = 'business-3';
+    const otherBusinessId = 'business-999';
+    const equityAccountId = 'coa-equity-3';
+    const otherBusinessAccountId = 'other-coa';
+
+    const engine = new AccountingEngine({
+      businessId,
+      accounts: [
+        { id: 'coa-main', businessId, code: '1100', name: 'Bank', accountType: 'ASSET', normalBalance: 'DEBIT', isSystem: false, isActive: true },
+        { id: equityAccountId, businessId, code: '3000', name: 'Opening Equity', accountType: 'EQUITY', normalBalance: 'CREDIT', isSystem: true, isActive: true },
+        { id: otherBusinessAccountId, businessId: otherBusinessId, code: '1200', name: 'Other Business Cash', accountType: 'ASSET', normalBalance: 'DEBIT', isSystem: false, isActive: true },
+      ],
+    });
+
+    const service = new FinancialAccountService(engine);
+    expect(() => service.createFinancialAccount({
+      businessId,
+      name: 'Bad Mapping',
+      type: 'BANK',
+      accountCode: 'BAD-MAP',
+      currency: 'MYR',
+      accountId: otherBusinessAccountId,
+      openingBalance: '0.00',
+      status: 'ACTIVE',
+    })).toThrow('does not belong to this business');
+  });
 });

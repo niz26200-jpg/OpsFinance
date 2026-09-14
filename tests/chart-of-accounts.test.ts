@@ -221,4 +221,42 @@ describe('chart of accounts service', () => {
 
     expect(() => svc.updateAccount({ businessId: 'business-11', id: 'cash', name: 'Banked cash' })).toThrow('posted journals');
   });
+
+  it('rejects parent relationships that cross account types', () => {
+    const engine = new AccountingEngine({
+      businessId: 'business-12',
+      accounts: [
+        { id: 'asset-root', businessId: 'business-12', code: '1000', name: 'Assets', accountType: 'ASSET', normalBalance: 'DEBIT', isSystem: true, isActive: true },
+        { id: 'revenue-root', businessId: 'business-12', code: '4000', name: 'Revenue', accountType: 'REVENUE', normalBalance: 'CREDIT', isSystem: true, isActive: true },
+      ],
+    });
+
+    const svc = new ChartOfAccountsService(engine);
+    expect(() => svc.createAccount({
+      businessId: 'business-12',
+      code: '1100',
+      name: 'Cash',
+      accountType: 'ASSET',
+      parentId: 'revenue-root',
+      normalBalance: 'DEBIT',
+      isActive: true,
+    })).toThrow('Parent relationship');
+  });
+
+  it('prevents circular parent chains during updates', () => {
+    const engine = new AccountingEngine({
+      businessId: 'business-13',
+      accounts: [
+        { id: 'root', businessId: 'business-13', code: '1000', name: 'Root Assets', accountType: 'ASSET', normalBalance: 'DEBIT', isSystem: false, isActive: true },
+        { id: 'cash', businessId: 'business-13', code: '1100', name: 'Cash', accountType: 'ASSET', normalBalance: 'DEBIT', parentId: 'root', isSystem: false, isActive: true },
+      ],
+    });
+
+    const svc = new ChartOfAccountsService(engine);
+    expect(() => svc.updateAccount({
+      businessId: 'business-13',
+      id: 'root',
+      parentId: 'cash',
+    })).toThrow('Circular');
+  });
 });

@@ -1,3 +1,6 @@
+import type { JournalEntry } from './accounting';
+import type { TransactionRecord } from './transactions';
+
 export interface RepositoryError extends Error {
   code?: string;
 }
@@ -13,8 +16,16 @@ export interface FinancialAccountRepository<T> extends AccountRepository<T> {
   listByBusiness(businessId: string): T[];
 }
 
+export interface TransactionRepository<T extends TransactionRecord> extends AccountRepository<T> {
+  listByBusiness(businessId: string): T[];
+}
+
+export interface JournalRepository<T extends JournalEntry> extends AccountRepository<T> {
+  listByBusiness(businessId: string): T[];
+}
+
 export class LocalAccountRepository<T extends { businessId: string; id: string }> implements AccountRepository<T> {
-  private readonly store = new Map<string, T>();
+  protected readonly store = new Map<string, T>();
 
   listByBusiness(businessId: string): T[] {
     return [...this.store.values()].filter((entry) => entry.businessId === businessId);
@@ -45,3 +56,7 @@ export class LocalAccountRepository<T extends { businessId: string; id: string }
 }
 
 export class LocalFinancialAccountRepository<T extends { businessId: string; id: string }> extends LocalAccountRepository<T> implements FinancialAccountRepository<T> {}
+
+export class LocalTransactionRepository extends LocalAccountRepository<TransactionRecord> implements TransactionRepository<TransactionRecord> {}
+
+export class LocalJournalRepository extends LocalAccountRepository<JournalEntry> implements JournalRepository<JournalEntry> {}

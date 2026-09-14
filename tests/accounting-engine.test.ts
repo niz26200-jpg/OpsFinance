@@ -8,6 +8,8 @@ import {
   createTransferJournal,
   type JournalLineInput,
 } from '../packages/accounting';
+import { LocalJournalRepository, LocalTransactionRepository } from '../packages/repositories';
+import { TransactionService } from '../packages/transactions';
 
 describe('Phase 2 accounting engine', () => {
   const businessId = '11111111-1111-4111-8111-111111111111';
@@ -259,5 +261,68 @@ describe('Phase 2 accounting engine', () => {
     const value = '0.01';
     expect(engine.toDecimal(value).toString()).toBe('0.01');
     expect(engine.toDecimal('10.00').add(engine.toDecimal('0.01')).toString()).toBe('10.01');
+  });
+
+  it('rejects transactions that target financial accounts outside the business', () => {
+    const otherBusinessId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const otherBusinessBankId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const engineWithOtherBusiness = new AccountingEngine({
+      businessId,
+      accounts: [
+        { id: revenueAccountId, businessId, code: '4000', name: 'Sales', accountType: 'REVENUE', normalBalance: 'CREDIT', isSystem: false, isActive: true },
+        { id: expenseAccountId, businessId, code: '6000', name: 'Petrol', accountType: 'EXPENSE', normalBalance: 'DEBIT', isSystem: false, isActive: true },
+        { id: cashAccountId, businessId, code: '1100', name: 'Cash', accountType: 'ASSET', normalBalance: 'DEBIT', isSystem: false, isActive: true },
+        { id: openingEquityAccountId, businessId, code: '3000', name: 'Opening Equity', accountType: 'EQUITY', normalBalance: 'CREDIT', isSystem: true, isActive: true },
+      ],
+      periods: [{ id: 'period-1', businessId, name: '2026-09', startDate: '2026-09-01', endDate: '2026-09-30', status: 'OPEN' }],
+      financialAccounts: [{ id: otherBusinessBankId, businessId: otherBusinessId, name: 'Other Bank', type: 'BANK', accountCode: 'OTHER-BANK', currency: 'MYR', status: 'ACTIVE' }],
+    });
+    const service = new TransactionService(engineWithOtherBusiness);
+
+    expect(() => service.createTransaction({
+      businessId,
+      type: 'MONEY_IN',
+      date: '2026-09-12',
+      financialAccountId: otherBusinessBankId,
+      amount: '50.00',
+      description: 'Bad business mapping',
+      accountId: revenueAccountId,
+      createdBy: 'user-1',
+    })).toThrow();
+  });
+
+  it('supports local transaction and journal repositories with business filtering', () => {
+    const transactionRepository = new LocalTransactionRepository();
+    const journalRepository = new LocalJournalRepository();
+
+    const transaction = {
+      id: 'txn-10',
+      businessId,
+      type: 'MONEY_IN' as const,
+      date: '2026-09-12',
+      description: 'Repository transaction',
+      amount: '10.00',
+      financialAccountId: customerBankId,
+      accountId: revenueAccountId,
+      status: 'POSTED' as const,
+      createdAt: '2026-09-12T00:00:00.000Z',
+      updatedAt: '2026-09-12T00:00:00.000Z',
+    };
+
+    transactionRepository.create(transaction);
+    journalRepository.create({
+      id: 'journal-10',
+      businessId,
+      journalNo: 'J-10',
+      journalDate: '2026-09-12',
+      sourceType: 'MANUAL',
+      status: 'POSTED',
+      createdAt: '2026-09-12T00:00:00.000Z',
+      lines: [],
+    });
+
+    expect(transactionRepository.listByBusiness(businessId)).toHaveLength(1);
+    expect(journalRepository.getById(businessId, 'journal-10').journalNo).toBe('J-10');
+    expect(() => transactionRepository.getById(otherBusinessId, 'txn-10')).toThrow('not found');
   });
 });

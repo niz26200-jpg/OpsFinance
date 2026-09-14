@@ -150,6 +150,68 @@ export class TransactionService {
     this.engine = engine;
   }
 
+  private getBusinessAccounts(): Map<string, any> {
+    return (this.engine as any).accounts as Map<string, any>;
+  }
+
+  private getBusinessFinancialAccounts(): Map<string, any> {
+    return (this.engine as any).financialAccounts as Map<string, any>;
+  }
+
+  private assertBusinessOwnedAccount(businessId: string, accountId: string | undefined, label: string): void {
+    if (!accountId) {
+      return;
+    }
+
+    const account = this.getBusinessAccounts().get(accountId);
+    if (!account) {
+      throw new Error(`${label} does not exist.`);
+    }
+
+    if (account.businessId !== businessId) {
+      throw new Error(`${label} does not belong to this business.`);
+    }
+  }
+
+  private assertBusinessOwnedFinancialAccount(
+    businessId: string,
+    financialAccountId: string | undefined,
+    label = 'Financial account',
+    allowChartAccount = false,
+  ): void {
+    if (!financialAccountId) {
+      return;
+    }
+
+    const account = this.getBusinessFinancialAccounts().get(financialAccountId);
+    if (account) {
+      if (account.businessId !== businessId) {
+        throw new Error(`${label} does not belong to this business.`);
+      }
+      if (account.status === 'INACTIVE') {
+        throw new Error(`${label} is inactive.`);
+      }
+      return;
+    }
+
+    if (!allowChartAccount) {
+      throw new Error(`${label} does not exist.`);
+    }
+
+    const coaAccount = this.getBusinessAccounts().get(financialAccountId);
+    if (!coaAccount) {
+      throw new Error(`${label} does not exist.`);
+    }
+
+    if (coaAccount.businessId !== businessId) {
+      throw new Error(`${label} does not belong to this business.`);
+    }
+
+    if (coaAccount.isActive === false) {
+      throw new Error(`${label} is inactive.`);
+    }
+  }
+
   getTransactions(businessId: string): TransactionRecord[] {
     this.engine.authorizeBusiness(businessId, this.engine.businessId);
     return [...this.transactions.values()].filter((transaction) => transaction.businessId === businessId);
@@ -237,6 +299,16 @@ export class TransactionService {
       if (!transaction.accountId) {
         errors.push('Money In requires a revenue account.');
       }
+      try {
+        this.assertBusinessOwnedFinancialAccount(transaction.businessId, transaction.financialAccountId, 'Financial account');
+      } catch (error) {
+        errors.push((error as Error).message);
+      }
+      try {
+        this.assertBusinessOwnedAccount(transaction.businessId, transaction.accountId, 'Revenue account');
+      } catch (error) {
+        errors.push((error as Error).message);
+      }
     }
 
     if (transaction.type === 'MONEY_OUT') {
@@ -246,6 +318,16 @@ export class TransactionService {
       if (!transaction.accountId) {
         errors.push('Money Out requires an expense account.');
       }
+      try {
+        this.assertBusinessOwnedFinancialAccount(transaction.businessId, transaction.financialAccountId, 'Financial account');
+      } catch (error) {
+        errors.push((error as Error).message);
+      }
+      try {
+        this.assertBusinessOwnedAccount(transaction.businessId, transaction.accountId, 'Expense account');
+      } catch (error) {
+        errors.push((error as Error).message);
+      }
     }
 
     if (transaction.type === 'TRANSFER') {
@@ -254,6 +336,16 @@ export class TransactionService {
       }
       if (transaction.fromFinancialAccountId && transaction.toFinancialAccountId && transaction.fromFinancialAccountId === transaction.toFinancialAccountId) {
         errors.push('Source and destination accounts cannot be the same.');
+      }
+      try {
+        this.assertBusinessOwnedFinancialAccount(transaction.businessId, transaction.fromFinancialAccountId, 'Source financial account', true);
+      } catch (error) {
+        errors.push((error as Error).message);
+      }
+      try {
+        this.assertBusinessOwnedFinancialAccount(transaction.businessId, transaction.toFinancialAccountId, 'Destination financial account', true);
+      } catch (error) {
+        errors.push((error as Error).message);
       }
     }
 
@@ -315,6 +407,16 @@ export class TransactionService {
 
   createTransaction(input: TransactionCreateInput): TransactionRecord {
     this.engine.authorizeBusiness(input.businessId, this.engine.businessId);
+
+    if (input.type === 'MONEY_IN' || input.type === 'MONEY_OUT') {
+      this.assertBusinessOwnedFinancialAccount(input.businessId, input.financialAccountId, 'Financial account');
+      this.assertBusinessOwnedAccount(input.businessId, input.accountId, input.type === 'MONEY_IN' ? 'Revenue account' : 'Expense account');
+    }
+
+    if (input.type === 'TRANSFER') {
+      this.assertBusinessOwnedFinancialAccount(input.businessId, input.fromFinancialAccountId, 'Source financial account', true);
+      this.assertBusinessOwnedFinancialAccount(input.businessId, input.toFinancialAccountId, 'Destination financial account', true);
+    }
 
     if (input.idempotencyKey && this.idempotency.has(input.idempotencyKey)) {
       const existingId = this.idempotency.get(input.idempotencyKey);

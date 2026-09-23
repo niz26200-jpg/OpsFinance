@@ -497,6 +497,10 @@ export class UploadConvertService {
           postedAt: null,
           errorInfo: [],
           duplicateReference: effectiveDuplicateReference,
+          rawData: csvText,
+          normalizedData: null,
+          importIdentifier: `${businessId}:${fileHash}`,
+          metadata: { size: csvText.length, mimeType: 'text/csv', extension: fileName.split('.').pop()?.toLowerCase() ?? '' },
         };
 
     this.uploads.set(uploadId, uploadRecord);

@@ -7,6 +7,7 @@ import {
   type JournalInput,
   type JournalLineInput,
 } from './accounting';
+import type { BillingFeature, SubscriptionService } from './subscriptions';
 
 export function createDemoTransactionService(): TransactionService {
   const businessId = '11111111-1111-4111-8111-111111111111';
@@ -145,9 +146,17 @@ export class TransactionService {
   private readonly engine: AccountingEngine;
   private readonly transactions = new Map<string, TransactionRecord>();
   private readonly idempotency = new Map<string, string>();
+  private readonly subscriptionService?: SubscriptionService;
 
-  constructor(engine: AccountingEngine) {
+  constructor(engine: AccountingEngine, options: { subscriptionService?: SubscriptionService } = {}) {
     this.engine = engine;
+    this.subscriptionService = options.subscriptionService;
+  }
+
+  private assertEntitled(businessId: string, feature: BillingFeature, actor?: string): void {
+    if (this.subscriptionService) {
+      this.subscriptionService.assertFeatureAccess(businessId, feature, actor ?? '');
+    }
   }
 
   private getBusinessAccounts(): Map<string, any> {
@@ -212,7 +221,8 @@ export class TransactionService {
     }
   }
 
-  getTransactions(businessId: string): TransactionRecord[] {
+  getTransactions(businessId: string, actor?: string): TransactionRecord[] {
+    this.assertEntitled(businessId, 'transactions', actor);
     this.engine.authorizeBusiness(businessId, this.engine.businessId);
     return [...this.transactions.values()].filter((transaction) => transaction.businessId === businessId);
   }
@@ -406,6 +416,7 @@ export class TransactionService {
   }
 
   createTransaction(input: TransactionCreateInput): TransactionRecord {
+    this.assertEntitled(input.businessId, 'transactions', input.createdBy);
     this.engine.authorizeBusiness(input.businessId, this.engine.businessId);
 
     if (input.type === 'MONEY_IN' || input.type === 'MONEY_OUT') {
@@ -537,6 +548,7 @@ export class TransactionService {
     if (!existing) {
       throw new Error('Transaction not found.');
     }
+    this.assertEntitled(existing.businessId, 'transactions', postedBy);
 
     if (idempotencyKey && this.idempotency.has(idempotencyKey)) {
       const existingId = this.idempotency.get(idempotencyKey);

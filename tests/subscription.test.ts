@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
 import { AccountingEngine } from '../packages/accounting';
+import { BusinessService } from '../packages/business';
 import { PLATFORM_FINANCE_POLICY, STARTER_PLAN, SubscriptionService } from '../packages/subscriptions';
+import { TransactionService } from '../packages/transactions';
 
 describe('Phase 8 subscription and billing', () => {
   it('defines the locked Starter plan and lifecycle states', () => {
@@ -32,6 +34,8 @@ describe('Phase 8 subscription and billing', () => {
     expect(service.getBusinessSubscription('business-a').status).toBe('GRACE_PERIOD');
 
     service.transitionStatus(subscription.id, 'SUSPENDED', 'user-a');
+    service.initiatePayment(subscription.id, 'INV-REACTIVATE', '29.00', 'MYR', 'user-a', 'evt-reactivate');
+    service.recordPaymentStatus(subscription.id, 'evt-reactivate', 'PAID', 'user-a');
     expect(service.getBusinessSubscription('business-a').status).toBe('SUSPENDED');
 
     service.reactivateSubscription(subscription.id, 'user-a');
@@ -148,6 +152,8 @@ describe('Phase 8 subscription and billing', () => {
     service.transitionStatus(subscription.id, 'PAST_DUE', 'user-a');
     service.transitionStatus(subscription.id, 'GRACE_PERIOD', 'user-a');
     service.transitionStatus(subscription.id, 'SUSPENDED', 'user-a');
+    service.initiatePayment(subscription.id, 'INV-AUDIT-REACTIVATE', '29.00', 'MYR', 'user-a', 'evt-audit-reactivate');
+    service.recordPaymentStatus(subscription.id, 'evt-audit-reactivate', 'PAID', 'user-a');
     service.reactivateSubscription(subscription.id, 'user-a');
     service.initiatePayment(subscription.id, 'INV-AUDIT', '29.00', 'MYR', 'user-a', 'evt-audit');
     service.recordPaymentStatus(subscription.id, 'evt-audit', 'PAID', 'user-a');
@@ -232,5 +238,91 @@ describe('Phase 8 subscription and billing', () => {
     expect(STARTER_PLAN.monthlyPrice).toBe('29.00');
     expect(service.getConfig().livePaymentProvider).toBe('NOT_CONFIGURED');
     expect(service.getConfig().liveSupabaseUat).toBe('BLOCKED');
+  });
+
+  it('enforces owner authorization and safe cross-business failures', () => {
+    const service = new SubscriptionService();
+    const subscription = service.registerBusiness('business-a', 'owner-a');
+
+    expect(() => service.transitionStatus(subscription.id, 'PAST_DUE', 'attacker')).toThrow('Business access denied.');
+    expect(() => service.getBusinessSubscription('business-a', 'attacker')).toThrow('Business access denied.');
+    expect(() => service.getPaymentHistory(subscription.id, 'attacker')).toThrow('Business access denied.');
+    expect(() => service.assertFeatureAccess('business-a', 'reports', 'attacker')).toThrow('Business access denied.');
+    expect(() => service.assertFeatureAccess('business-b', 'reports', 'attacker')).toThrow('Business access denied.');
+  });
+
+  it('allows suspended reads but blocks protected writes and records denial', () => {
+    const service = new SubscriptionService();
+    const subscription = service.registerBusiness('business-a', 'owner-a');
+    service.transitionStatus(subscription.id, 'PAST_DUE', 'owner-a');
+    service.transitionStatus(subscription.id, 'GRACE_PERIOD', 'owner-a');
+    service.transitionStatus(subscription.id, 'SUSPENDED', 'owner-a');
+
+    expect(service.canAccess('reports', { businessId: 'business-a', userId: 'owner-a', operation: 'READ' })).toBe(true);
+    expect(service.canAccess('transactions', { businessId: 'business-a', userId: 'owner-a', operation: 'WRITE' })).toBe(false);
+    expect(() => service.assertFeatureAccess('business-a', 'transactions', 'owner-a')).toThrow('Feature access denied.');
+    expect(service.getAuditTrail(subscription.id, 'owner-a').some((event) => event.event === 'entitlement_denied')).toBe(true);
+  });
+
+  it('makes business registration idempotent and enforces the Starter business limit at the service boundary', () => {
+    const subscriptions = new SubscriptionService();
+    const businesses = new BusinessService([], [], {}, subscriptions);
+    const input = {
+      id: 'business-a',
+      name: 'Business A',
+      baseCurrency: 'MYR',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+
+    const first = businesses.registerBusiness(input, 'owner-a');
+    const repeat = businesses.registerBusiness(input, 'owner-a');
+    expect(repeat.id).toBe(first.id);
+    expect(() => businesses.registerBusiness({ ...input, id: 'business-b', name: 'Business B' }, 'owner-b')).toThrow('Starter plan allows only one business.');
+  });
+
+  it('does not renew twice for the same paid payment event', () => {
+    const service = new SubscriptionService();
+    const subscription = service.registerBusiness('business-a', 'owner-a');
+    service.initiatePayment(subscription.id, 'INV-RENEW-IDEMPOTENT', '29.00', 'MYR', 'owner-a', 'evt-renew-idempotent');
+    service.recordPaymentStatus(subscription.id, 'evt-renew-idempotent', 'PAID', 'owner-a');
+
+    const first = service.renewSubscription(subscription.id, 'owner-a');
+    const second = service.renewSubscription(subscription.id, 'owner-a');
+    expect(second.currentPeriodEnd).toBe(first.currentPeriodEnd);
+    expect(service.getAuditTrail(subscription.id, 'owner-a').filter((event) => event.event === 'renewal_succeeded')).toHaveLength(1);
+  });
+
+  it('enforces subscription entitlement at the canonical transaction boundary', () => {
+    const subscriptions = new SubscriptionService();
+    subscriptions.registerBusiness('business-a', 'owner-a');
+    const engine = new AccountingEngine({
+      businessId: 'business-a',
+      accounts: [{ id: 'revenue', businessId: 'business-a', code: '4000', name: 'Revenue', accountType: 'REVENUE', normalBalance: 'CREDIT', isActive: true }],
+      periods: [{ id: 'period', businessId: 'business-a', name: '2026-09', startDate: '2026-09-01', endDate: '2026-09-30', status: 'OPEN' }],
+      financialAccounts: [{ id: 'bank', businessId: 'business-a', name: 'Bank', type: 'BANK', accountCode: 'BANK', currency: 'MYR', status: 'ACTIVE' }],
+    });
+    const transactions = new TransactionService(engine, { subscriptionService: subscriptions });
+
+    expect(() => transactions.createTransaction({
+      businessId: 'business-a',
+      type: 'MONEY_IN',
+      date: '2026-09-12',
+      description: 'Authorized payment',
+      amount: '10.00',
+      financialAccountId: 'bank',
+      accountId: 'revenue',
+      createdBy: 'owner-a',
+    })).not.toThrow();
+    expect(() => transactions.createTransaction({
+      businessId: 'business-a',
+      type: 'MONEY_IN',
+      date: '2026-09-12',
+      description: 'Unauthorized payment',
+      amount: '10.00',
+      financialAccountId: 'bank',
+      accountId: 'revenue',
+      createdBy: 'attacker',
+    })).toThrow('Business access denied.');
   });
 });

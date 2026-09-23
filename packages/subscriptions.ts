@@ -1,6 +1,7 @@
 export type PlanCode = 'STARTER';
 export type SubscriptionLifecycleStatus = 'ACTIVE' | 'PAST_DUE' | 'GRACE_PERIOD' | 'SUSPENDED' | 'CANCELLED';
 export type PaymentStatus = 'INITIATED' | 'PENDING' | 'AUTHORIZED' | 'PAID' | 'FAILED' | 'CANCELLED' | 'REFUNDED';
+export type AccessOperation = 'READ' | 'WRITE';
 export type BillingFeature =
   | 'dashboard'
   | 'transactions'
@@ -67,12 +68,19 @@ export interface PaymentRecord {
 }
 
 export interface BillingAuditEvent {
+  id: string;
   businessId: string;
   actor: string;
   event: string;
   target: string;
   timestamp: string;
   metadata?: Record<string, string | number | boolean | null>;
+}
+
+export interface EntitlementContext {
+  businessId: string;
+  userId: string;
+  operation?: AccessOperation;
 }
 
 export interface BillingConfiguration {
@@ -127,11 +135,12 @@ const TRANSITIONS: Record<SubscriptionLifecycleStatus, SubscriptionLifecycleStat
 export class SubscriptionService {
   private readonly subscriptions = new Map<string, SubscriptionRecord>();
   private readonly businessSubscriptionById = new Map<string, string>();
-  private readonly membersByBusiness = new Map<string, Set<string>>();
+  private readonly membersByBusiness = new Map<string, Map<string, 'OWNER' | 'ADMIN' | 'ACCOUNTANT' | 'STAFF' | 'VIEWER'>>();
   private readonly paymentsBySubscription = new Map<string, PaymentRecord[]>();
   private readonly paymentsByEventId = new Map<string, PaymentRecord>();
   private readonly paymentIdempotency = new Map<string, string>();
   private readonly auditTrail = new Map<string, BillingAuditEvent[]>();
+  private readonly renewedPeriods = new Set<string>();
   private readonly config: BillingConfiguration;
 
   constructor(config: Partial<BillingConfiguration> = {}) {
@@ -149,7 +158,8 @@ export class SubscriptionService {
     return STARTER_PLAN;
   }
 
-  getBusinessSubscription(businessId: string): SubscriptionRecord {
+  getBusinessSubscription(businessId: string, actor?: string): SubscriptionRecord {
+    if (actor) this.assertBusinessMember(businessId, actor);
     const subscriptionId = this.businessSubscriptionById.get(businessId);
     if (!subscriptionId) {
       throw new Error('Subscription not found for business.');
@@ -161,18 +171,47 @@ export class SubscriptionService {
     return { ...subscription };
   }
 
-  getAuditTrail(subscriptionId: string): BillingAuditEvent[] {
+  getAuditTrail(subscriptionId: string, actor?: string): BillingAuditEvent[] {
+    const subscription = this.getSubscription(subscriptionId);
+    if (actor) this.assertBusinessMember(subscription.businessId, actor);
     return [...(this.auditTrail.get(subscriptionId) ?? [])];
   }
 
-  getPaymentHistory(subscriptionId: string): PaymentRecord[] {
+  getPaymentHistory(subscriptionId: string, actor?: string): PaymentRecord[] {
+    const subscription = this.getSubscription(subscriptionId);
+    if (actor) this.assertBusinessMember(subscription.businessId, actor);
     return [...(this.paymentsBySubscription.get(subscriptionId) ?? [])];
   }
 
   private setAuditEvent(subscriptionId: string, businessId: string, actor: string, event: string, target: string, metadata: Record<string, string | number | boolean | null> = {}): void {
     const trail = this.auditTrail.get(subscriptionId) ?? [];
-    trail.push({ businessId, actor, event, target, timestamp: new Date().toISOString(), metadata });
+    trail.push({ id: `billing-audit-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`, businessId, actor, event, target, timestamp: new Date().toISOString(), metadata });
     this.auditTrail.set(subscriptionId, trail);
+  }
+
+  private getSubscription(subscriptionId: string): SubscriptionRecord {
+    const subscription = this.subscriptions.get(subscriptionId);
+    if (!subscription) throw new Error('Subscription not found.');
+    return subscription;
+  }
+
+  private assertBusinessMember(businessId: string, actor: string): void {
+    const members = this.membersByBusiness.get(businessId);
+    if (!members?.has(actor)) {
+      throw new Error('Business access denied.');
+    }
+  }
+
+  private assertBusinessOwnerForSubscription(subscription: SubscriptionRecord, actor: string): void {
+    this.assertBusinessMember(subscription.businessId, actor);
+    if (subscription.ownerUserId !== actor) {
+      throw new Error('Business access denied.');
+    }
+  }
+
+  private recordDeniedAccess(businessId: string, actor: string, event: string, target: string): void {
+    const subscriptionId = this.businessSubscriptionById.get(businessId);
+    if (subscriptionId) this.setAuditEvent(subscriptionId, businessId, actor, event, target, { allowed: false });
   }
 
   private assertStatusTransition(from: SubscriptionLifecycleStatus, to: SubscriptionLifecycleStatus): void {
@@ -219,7 +258,9 @@ export class SubscriptionService {
   registerBusiness(businessId: string, ownerUserId: string): SubscriptionRecord {
     const existing = this.businessSubscriptionById.get(businessId);
     if (existing) {
-      return this.subscriptions.get(existing)!;
+      const existingSubscription = this.getSubscription(existing);
+      if (existingSubscription.ownerUserId !== ownerUserId) throw new Error('Business access denied.');
+      return { ...existingSubscription };
     }
 
     this.ensureStarterBusinessLimit(businessId, ownerUserId);
@@ -246,8 +287,8 @@ export class SubscriptionService {
 
     this.subscriptions.set(subscription.id, subscription);
     this.businessSubscriptionById.set(businessId, subscription.id);
-    const activeMembers = this.membersByBusiness.get(businessId) ?? new Set<string>();
-    activeMembers.add(ownerUserId);
+    const activeMembers = this.membersByBusiness.get(businessId) ?? new Map<string, 'OWNER' | 'ADMIN' | 'ACCOUNTANT' | 'STAFF' | 'VIEWER'>();
+    activeMembers.set(ownerUserId, 'OWNER');
     this.membersByBusiness.set(businessId, activeMembers);
 
     this.setAuditEvent(subscription.id, businessId, ownerUserId, 'subscription_created', subscription.id, {
@@ -263,49 +304,55 @@ export class SubscriptionService {
     return { ...subscription };
   }
 
-  addBusinessMember(businessId: string, userId: string, role: 'OWNER' | 'ADMIN' | 'ACCOUNTANT' | 'STAFF' | 'VIEWER' = 'VIEWER'): void {
+  addBusinessMember(businessId: string, userId: string, role: 'OWNER' | 'ADMIN' | 'ACCOUNTANT' | 'STAFF' | 'VIEWER' = 'VIEWER', actor?: string): void {
     const subscriptionId = this.businessSubscriptionById.get(businessId);
     if (!subscriptionId) {
       throw new Error('Business is not subscribed.');
     }
 
-    const current = this.membersByBusiness.get(businessId) ?? new Set<string>();
-    const plan = this.subscriptions.get(subscriptionId)?.plan ?? 'STARTER';
+    const subscription = this.getSubscription(subscriptionId);
+    const actingUser = actor ?? subscription.ownerUserId;
+    this.assertBusinessOwnerForSubscription(subscription, actingUser);
+    const current = this.membersByBusiness.get(businessId) ?? new Map<string, 'OWNER' | 'ADMIN' | 'ACCOUNTANT' | 'STAFF' | 'VIEWER'>();
+    const plan = subscription.plan;
     if (plan === 'STARTER' && !current.has(userId) && current.size >= STARTER_PLAN.maxUsers) {
+      this.recordDeniedAccess(businessId, actingUser, 'user_limit_denied', userId);
       throw new Error('Starter plan allows only one active user on the business.');
     }
 
-    current.add(userId);
+    current.set(userId, role);
     this.membersByBusiness.set(businessId, current);
-    const subscription = this.subscriptions.get(subscriptionId)!;
     this.setAuditEvent(subscription.id, businessId, userId, 'member_added', userId, { role, businessId });
   }
 
-  assertFeatureAccess(businessId: string, feature: BillingFeature, actor: string): void {
-    const subscription = this.getBusinessSubscription(businessId);
-    if (!subscription || !subscription.status || subscription.status === 'CANCELLED') {
-      throw new Error('Business subscription is not active.');
-    }
-
-    const businessMembers = this.membersByBusiness.get(businessId) ?? new Set<string>();
-    if (!businessMembers.has(actor)) {
-      throw new Error('User does not have access to this business.');
-    }
-
+  assertFeatureAccess(businessId: string, feature: BillingFeature, actor: string, operation: AccessOperation = 'WRITE'): void {
+    const subscription = this.getBusinessSubscription(businessId, actor);
     const definition = this.getPlanDefinition(subscription.plan);
     if (!definition.features.includes(feature)) {
-      throw new Error(`Feature ${feature} is not available on ${subscription.plan}.`);
+      this.recordDeniedAccess(businessId, actor, 'entitlement_denied', feature);
+      throw new Error('Feature access denied.');
     }
-    if (subscription.status === 'SUSPENDED') {
-      throw new Error('Suspended subscriptions cannot access protected business features.');
+    if (subscription.status === 'CANCELLED' || (subscription.status === 'SUSPENDED' && operation === 'WRITE')) {
+      this.recordDeniedAccess(businessId, actor, 'entitlement_denied', feature);
+      throw new Error('Feature access denied.');
     }
-    this.setAuditEvent(subscription.id, businessId, actor, 'feature_access_checked', feature, { allowed: true, feature });
+    this.setAuditEvent(subscription.id, businessId, actor, 'feature_access_checked', feature, { allowed: true, feature, operation });
+  }
+
+  canAccess(feature: BillingFeature, context: EntitlementContext): boolean {
+    try {
+      this.assertFeatureAccess(context.businessId, feature, context.userId, context.operation ?? 'READ');
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   transitionStatus(subscriptionId: string, nextStatus: SubscriptionLifecycleStatus, actor: string): SubscriptionRecord {
-    const subscription = this.subscriptions.get(subscriptionId);
-    if (!subscription) {
-      throw new Error('Subscription not found.');
+    const subscription = this.getSubscription(subscriptionId);
+    this.assertBusinessOwnerForSubscription(subscription, actor);
+    if (nextStatus === 'ACTIVE' && subscription.status === 'SUSPENDED') {
+      throw new Error('Suspended subscriptions require payment-backed reactivation.');
     }
 
     this.assertStatusTransition(subscription.status, nextStatus);
@@ -337,14 +384,18 @@ export class SubscriptionService {
   }
 
   reactivateSubscription(subscriptionId: string, actor: string): SubscriptionRecord {
-    const subscription = this.subscriptions.get(subscriptionId);
-    if (!subscription) {
-      throw new Error('Subscription not found.');
-    }
+    const subscription = this.getSubscription(subscriptionId);
+    this.assertBusinessOwnerForSubscription(subscription, actor);
 
     const allowedStatuses: SubscriptionLifecycleStatus[] = ['PAST_DUE', 'GRACE_PERIOD', 'SUSPENDED'];
     if (!allowedStatuses.includes(subscription.status)) {
       throw new Error(`Reactivation requires status in ${allowedStatuses.join(', ')}.`);
+    }
+    if (subscription.status === 'SUSPENDED') {
+      const hasPaidPayment = (this.paymentsBySubscription.get(subscriptionId) ?? []).some((payment) => payment.status === 'PAID');
+      if (!hasPaidPayment) {
+        throw new Error('Reactivation requires a successful payment.');
+      }
     }
     subscription.status = 'ACTIVE';
     subscription.gracePeriodStart = null;
@@ -359,9 +410,10 @@ export class SubscriptionService {
   }
 
   initiatePayment(subscriptionId: string, invoiceReference: string, amount: string, currency: string, actor: string, providerEventId?: string): PaymentRecord {
-    const subscription = this.subscriptions.get(subscriptionId);
-    if (!subscription) {
-      throw new Error('Subscription not found.');
+    const subscription = this.getSubscription(subscriptionId);
+    this.assertBusinessOwnerForSubscription(subscription, actor);
+    if (amount !== subscription.monthlyPrice || currency.toUpperCase() !== subscription.currency) {
+      throw new Error('Payment amount or currency does not match the subscription.');
     }
 
     const key = providerEventId ?? invoiceReference;
@@ -401,14 +453,16 @@ export class SubscriptionService {
   }
 
   recordPaymentStatus(subscriptionId: string, providerEventId: string, status: PaymentStatus, actor: string, failureReason?: string): PaymentRecord {
-    const subscription = this.subscriptions.get(subscriptionId);
-    if (!subscription) {
-      throw new Error('Subscription not found.');
-    }
+    const subscription = this.getSubscription(subscriptionId);
+    this.assertBusinessOwnerForSubscription(subscription, actor);
 
     const payment = [...(this.paymentsBySubscription.get(subscriptionId) ?? [])].find((entry) => entry.providerEventId === providerEventId)
       ?? this.paymentsByEventId.get(providerEventId)
       ?? [...(this.paymentsBySubscription.get(subscriptionId) ?? [])].find((entry) => entry.id === providerEventId);
+
+    if (payment && payment.subscriptionId !== subscriptionId) {
+      throw new Error('Payment event not found.');
+    }
 
     if (!payment) {
       const fallbackPayment: PaymentRecord = {
@@ -468,10 +522,8 @@ export class SubscriptionService {
   }
 
   renewSubscription(subscriptionId: string, actor: string): SubscriptionRecord {
-    const subscription = this.subscriptions.get(subscriptionId);
-    if (!subscription) {
-      throw new Error('Subscription not found.');
-    }
+    const subscription = this.getSubscription(subscriptionId);
+    this.assertBusinessOwnerForSubscription(subscription, actor);
 
     const payment = this.paymentsBySubscription.get(subscriptionId)?.find((entry) => entry.status === 'PAID') ?? null;
     if (!payment) {
@@ -479,6 +531,9 @@ export class SubscriptionService {
       this.setAuditEvent(subscription.id, subscription.businessId, actor, 'renewal_failed', subscription.id, { plan: subscription.plan, status: 'PAST_DUE' });
       return { ...this.subscriptions.get(subscriptionId)! };
     }
+
+    const renewalKey = `${subscription.id}:${payment.id}`;
+    if (this.renewedPeriods.has(renewalKey)) return { ...subscription };
 
     const oldPeriodEnd = new Date(subscription.currentPeriodEnd);
     const now = new Date();
@@ -491,6 +546,7 @@ export class SubscriptionService {
     subscription.suspendedAt = null;
     subscription.cancelledAt = null;
     subscription.updatedAt = new Date().toISOString();
+    this.renewedPeriods.add(renewalKey);
     this.setAuditEvent(subscription.id, subscription.businessId, actor, 'renewal_succeeded', subscription.id, {
       plan: subscription.plan,
       nextBillingDate: subscription.nextBillingDate,
@@ -499,10 +555,8 @@ export class SubscriptionService {
   }
 
   failRenewal(subscriptionId: string, actor: string, reason: string): SubscriptionRecord {
-    const subscription = this.subscriptions.get(subscriptionId);
-    if (!subscription) {
-      throw new Error('Subscription not found.');
-    }
+    const subscription = this.getSubscription(subscriptionId);
+    this.assertBusinessOwnerForSubscription(subscription, actor);
     if (subscription.status === 'ACTIVE') {
       this.transitionStatus(subscriptionId, 'PAST_DUE', actor);
     }
@@ -517,12 +571,11 @@ export class SubscriptionService {
   }
 
   cancelSubscription(subscriptionId: string, actor: string, effectiveAt: 'IMMEDIATE' | 'PERIOD_END' = 'PERIOD_END'): SubscriptionRecord {
-    const subscription = this.subscriptions.get(subscriptionId);
-    if (!subscription) {
-      throw new Error('Subscription not found.');
-    }
+    const subscription = this.getSubscription(subscriptionId);
+    this.assertBusinessOwnerForSubscription(subscription, actor);
 
     if (effectiveAt === 'PERIOD_END') {
+      this.assertStatusTransition(subscription.status, 'CANCELLED');
       subscription.status = 'CANCELLED';
       subscription.cancelledAt = new Date().toISOString();
       subscription.updatedAt = new Date().toISOString();

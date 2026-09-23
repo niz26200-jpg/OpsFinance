@@ -320,4 +320,26 @@ describe('Phase 7 upload and convert hardening', () => {
     expect(() => service.listUploads(otherBusinessId)).toThrow();
     expect(() => service.getUploadAuditTrail(upload.id, otherBusinessId)).toThrow();
   });
+
+  it('rejects invalid dates and preserves raw, normalized, and import metadata', () => {
+    const service = new UploadConvertService(engine);
+    const malformed = service.processBankStatementCsv(
+      'Date,Description,Reference,Debit,Credit,Balance\n2026-99-40,Payment,REF-1,,25.00,100.00',
+      'invalid-date.csv',
+      businessId,
+      'user-1',
+    );
+    expect(malformed.candidates).toHaveLength(0);
+    expect(malformed.errors[0].error).toContain('Malformed');
+
+    const csv = 'Date,Description,Reference,Debit,Credit,Balance\n2026-09-12,  Customer   payment  ,REF-2,,25.00,100.00';
+    const batch = service.processBankStatementCsv(csv, 'metadata.csv', businessId, 'user-1');
+    const upload = service.listUploads(businessId).find((record) => record.filename === 'metadata.csv');
+    expect(upload?.businessId).toBe(businessId);
+    expect(upload?.rawData).toBe(csv);
+    expect(upload?.normalizedData).toContain('Customer payment');
+    expect(upload?.importIdentifier).toContain(businessId);
+    expect(batch.candidates[0].raw.description).toContain('Customer');
+    expect(batch.candidates[0].normalized.description).toBe('Customer payment');
+  });
 });

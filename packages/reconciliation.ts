@@ -66,6 +66,7 @@ export interface BankTransaction {
   balance: string;
   direction: BankDirection;
   source: string;
+  transactionId?: string;
   status: 'IMPORTED' | 'MATCHED' | 'UNMATCHED' | 'IGNORED' | 'PARTIAL';
   raw?: Record<string, string>;
 }
@@ -261,11 +262,20 @@ export class ReconciliationService {
   addBankTransactions(statementId: string, transactions: BankTransaction[]): void {
     const statement = this.getStatement(statementId);
     for (const transaction of transactions) {
+      if (transaction.statementId !== statementId) {
+        throw new Error('Bank transaction does not belong to the statement.');
+      }
       if (transaction.businessId !== statement.businessId) {
         throw new Error('Bank transaction does not belong to the statement business.');
       }
       if (transaction.financialAccountId !== statement.financialAccountId) {
         throw new Error('Bank transaction does not belong to the financial account.');
+      }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(transaction.date)) {
+        throw new Error('Bank transaction date must be an ISO date.');
+      }
+      if (!new DecimalMoney(transaction.amount).isPositive()) {
+        throw new Error('Bank transaction amount must be positive.');
       }
       this.bankTransactions.set(transaction.id, transaction);
     }
@@ -274,6 +284,12 @@ export class ReconciliationService {
   addBookTransactions(transactions: BookTransaction[]): void {
     for (const transaction of transactions) {
       this.engine.authorizeBusiness(transaction.businessId, this.engine.businessId);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(transaction.date)) {
+        throw new Error('Book transaction date must be an ISO date.');
+      }
+      if (new DecimalMoney(transaction.amount).compare(DecimalMoney.zero()) < 0) {
+        throw new Error('Book transaction amount must be positive.');
+      }
       this.bookTransactions.set(transaction.id, transaction);
     }
   }
@@ -329,6 +345,11 @@ export class ReconciliationService {
       throw new Error('Financial account mismatch.');
     }
     if (bookTx.status !== 'POSTED') throw new Error('Only posted book transactions are eligible.');
+    if (!this.isDirectionCompatible(bankTx, bookTx)) throw new Error('Bank and book transaction directions do not match.');
+    const assignedElsewhere = [...this.matches.values()].find((match) => match.sessionId === session.id && (match.bankTransactionId === bankTransactionId || match.bookTransactionIds.includes(bookTransactionId)));
+    if (assignedElsewhere && !assignedElsewhere.bookTransactionIds.includes(bookTransactionId)) {
+      throw new Error('Bank or book transaction is already matched in this session.');
+    }
     if ([...this.matches.values()].some((match) => match.sessionId === session.id && match.bankTransactionId === bankTransactionId && match.bookTransactionIds.includes(bookTransactionId))) {
       return [...this.matches.values()].find((match) => match.sessionId === session.id && match.bankTransactionId === bankTransactionId && match.bookTransactionIds.includes(bookTransactionId))!;
     }
@@ -341,6 +362,7 @@ export class ReconciliationService {
 
     const match = this.buildMatch(bankTx, bookTx, session.id, actor, 'AUTO');
     this.matches.set(match.id, match);
+    bankTx.status = match.status === 'MATCHED' ? 'MATCHED' : 'PARTIAL';
     this.idempotency.set(key, match.id);
     this.addAuditEvent(session.id, actor, 'MATCH_CREATED', 'MATCH', match.id, `Matched bank ${bankTx.id} with book ${bookTx.id}`);
     return match;
@@ -355,6 +377,14 @@ export class ReconciliationService {
     if (bankTxs.length === 0 || bookTxs.length === 0) throw new Error('Match group requires at least one bank and one book transaction.');
     if (bankTxs.some((tx) => tx.businessId !== session.businessId || tx.financialAccountId !== session.financialAccountId)) throw new Error('Cross-business or cross-account match group is not allowed.');
     if (bookTxs.some((tx) => tx.businessId !== session.businessId || tx.financialAccountId !== session.financialAccountId)) throw new Error('Cross-business or cross-account match group is not allowed.');
+    if (bankTxs.some((bankTx) => bookTxs.some((bookTx) => !this.isDirectionCompatible(bankTx, bookTx)))) throw new Error('Bank and book transaction directions do not match.');
+
+    const sortedBankIds = [...bankIds].sort();
+    const sortedBookIds = [...bookIds].sort();
+    const duplicateGroup = [...this.groups.values()].find((group) => group.sessionId === session.id && [...group.bankTransactionIds].sort().join('|') === sortedBankIds.join('|') && [...group.bookTransactionIds].sort().join('|') === sortedBookIds.join('|'));
+    if (duplicateGroup) {
+      return duplicateGroup;
+    }
 
     const overlap = [...this.groups.values()].find((group) => {
       if (group.sessionId !== session.id) return false;
@@ -366,11 +396,6 @@ export class ReconciliationService {
     });
     if (overlap) {
       throw new Error('Match group cannot reuse bank or book transactions already assigned to another group in this session.');
-    }
-
-    const duplicateGroup = [...this.groups.values()].find((group) => group.sessionId === session.id && group.bankTransactionIds.length === bankIds.length && group.bookTransactionIds.length === bookIds.length && group.bankTransactionIds.every((id) => bankIds.includes(id)) && group.bookTransactionIds.every((id) => bookIds.includes(id)));
-    if (duplicateGroup) {
-      return duplicateGroup;
     }
 
     const bankTotal = bankTxs.reduce((sum, tx) => sum.add(new DecimalMoney(tx.amount)), DecimalMoney.zero());
@@ -391,6 +416,7 @@ export class ReconciliationService {
     };
 
     this.groups.set(group.id, group);
+    for (const transaction of bankTxs) transaction.status = group.status === 'MATCHED' ? 'MATCHED' : 'PARTIAL';
     this.addAuditEvent(session.id, actor, 'GROUP_CREATED', 'MATCH', group.id, `Match group created with ${bankTxs.length} bank and ${bookTxs.length} book transactions`);
     return group;
   }
@@ -408,6 +434,7 @@ export class ReconciliationService {
     if (bankTxs.length === 0 || bookTxs.length === 0) throw new Error('Manual match requires at least one bank and one book transaction.');
     if (bankTxs.some((tx) => tx.businessId !== session.businessId)) throw new Error('Cross-business manual match not allowed.');
     if (bookTxs.some((tx) => tx.businessId !== session.businessId)) throw new Error('Cross-business manual match not allowed.');
+    if (bankTxs.some((bankTx) => bookTxs.some((bookTx) => !this.isDirectionCompatible(bankTx, bookTx)))) throw new Error('Bank and book transaction directions do not match.');
 
     const bankTotal = bankTxs.reduce((sum, tx) => sum.add(new DecimalMoney(tx.amount)), DecimalMoney.zero());
     const bookTotal = bookTxs.reduce((sum, tx) => sum.add(new DecimalMoney(tx.amount)), DecimalMoney.zero());
@@ -434,6 +461,7 @@ export class ReconciliationService {
     };
 
     this.matches.set(match.id, match);
+    for (const transaction of bankTxs) transaction.status = 'MATCHED';
     this.addAuditEvent(sessionId, actor, 'MANUAL_MATCH', 'MATCH', match.id, `Manual match created for ${bankTxs.length} bank and ${bookTxs.length} book transactions`);
     return match;
   }
@@ -443,6 +471,8 @@ export class ReconciliationService {
     if (session.status === 'LOCKED') throw new Error('Locked reconciliations cannot be modified.');
     const bankTxs = bankIds.map((id) => this.bankTransactions.get(id)).filter(Boolean) as BankTransaction[];
     const bookTxs = bookIds.map((id) => this.bookTransactions.get(id)).filter(Boolean) as BookTransaction[];
+    if (bankTxs.length === 0 || bookTxs.length === 0) throw new Error('Partial match requires at least one bank and one book transaction.');
+    if (bankTxs.some((bankTx) => bookTxs.some((bookTx) => !this.isDirectionCompatible(bankTx, bookTx)))) throw new Error('Bank and book transaction directions do not match.');
     const bankTotal = bankTxs.reduce((sum, tx) => sum.add(new DecimalMoney(tx.amount)), DecimalMoney.zero());
     const bookTotal = bookTxs.reduce((sum, tx) => sum.add(new DecimalMoney(tx.amount)), DecimalMoney.zero());
     const diff = new DecimalMoney(difference ?? bankTotal.subtract(bookTotal).toString());
@@ -467,6 +497,7 @@ export class ReconciliationService {
     };
 
     this.matches.set(match.id, match);
+    for (const transaction of bankTxs) transaction.status = 'PARTIAL';
     this.addAuditEvent(sessionId, actor, 'PARTIAL_MATCH', 'MATCH', match.id, `Partial match created. Difference: ${diff.toString()}`);
     return match;
   }
@@ -628,7 +659,7 @@ export class ReconciliationService {
     const session = this.resolveSession(sessionId);
     if (session.status === 'LOCKED') throw new Error('Locked reconciliation cannot be completed again.');
     const summary = this.calculateSummary(session.statementId);
-    const unresolved = this.getUnmatchedBankTransactions(session.statementId).length > 0 || this.getUnmatchedBookTransactions(session.businessId).length > 0;
+    const unresolved = this.getUnmatchedBankTransactions(session.statementId).length > 0 || this.getUnmatchedBookTransactionsForSession(session).length > 0;
     const partialPending = this.getPartialMatches(session.statementId).some((match) => match.resolutionState !== 'APPROVED');
 
     if (unresolved || partialPending) {
@@ -680,7 +711,10 @@ export class ReconciliationService {
   }
 
   getUnmatchedBookTransactions(businessId: string): BookTransaction[] {
-    return this.getBookTransactions(businessId).filter((tx) => ![...this.matches.values()].some((match) => match.businessId === businessId && match.bookTransactionIds.includes(tx.id)));
+    const sessionBooks = [...this.sessions.values()]
+      .filter((session) => session.businessId === businessId)
+      .flatMap((session) => this.getBookTransactionsForStatement(this.getStatement(session.statementId)));
+    return sessionBooks.filter((tx, index, all) => all.findIndex((candidate) => candidate.id === tx.id) === index && ![...this.matches.values()].some((match) => match.businessId === businessId && match.bookTransactionIds.includes(tx.id)));
   }
 
   createCorrection(sessionId: string, actor: string, reason: string, target: { entityType: 'MATCH' | 'BANK_TRANSACTION' | 'BOOK_TRANSACTION' | 'SESSION'; entityId: string }): { sessionId: string; action: ReconciliationAction; reason: string } {
@@ -697,7 +731,7 @@ export class ReconciliationService {
     const statement = this.getStatement(statementId);
     const session = this.getSessionByStatement(statementId);
     const bankTransactions = this.getBankTransactions(statementId);
-    const bookTransactions = this.getBookTransactions(statement.businessId);
+    const bookTransactions = this.getBookTransactionsForStatement(statement);
 
     const bankTotal = bankTransactions.reduce((sum, tx) => {
       const value = tx.direction === 'DEBIT' ? new DecimalMoney(`-${tx.amount}`) : new DecimalMoney(tx.amount);
@@ -739,6 +773,15 @@ export class ReconciliationService {
 
   private getSessionByStatement(statementId: string): ReconciliationSession | undefined {
     return [...this.sessions.values()].find((session) => session.statementId === statementId);
+  }
+
+  private getBookTransactionsForStatement(statement: FinancialStatement): BookTransaction[] {
+    return this.getBookTransactions(statement.businessId).filter((transaction) => transaction.financialAccountId === statement.financialAccountId && transaction.date >= statement.startDate && transaction.date <= statement.endDate);
+  }
+
+  private getUnmatchedBookTransactionsForSession(session: ReconciliationSession): BookTransaction[] {
+    const statement = this.getStatement(session.statementId);
+    return this.getBookTransactionsForStatement(statement).filter((tx) => ![...this.matches.values()].some((match) => match.sessionId === session.id && match.bookTransactionIds.includes(tx.id)));
   }
 
   private resolveSession(sessionOrStatementId: string): ReconciliationSession {
@@ -783,12 +826,20 @@ export class ReconciliationService {
       const bankDate = new Date(bankTx.date).getTime();
       const bookDate = new Date(bookTx.date).getTime();
       if (Math.abs(bankDate - bookDate) / 86400000 > this.dateToleranceDays) return false;
-      return true;
+      return this.isDirectionCompatible(bankTx, bookTx);
     });
 
     if (!eligible.length) return null;
-    const best = eligible[0];
+    const ranked = eligible
+      .map((bookTx) => ({ bookTx, candidate: this.buildMatchCandidate(bankTx, bookTx) }))
+      .sort((left, right) => right.candidate.confidence - left.candidate.confidence || left.bookTx.id.localeCompare(right.bookTx.id));
+    if (ranked.length > 1 && ranked[0].candidate.confidence === ranked[1].candidate.confidence) return null;
+    const best = ranked[0].bookTx;
     return this.buildMatchCandidate(bankTx, best);
+  }
+
+  private isDirectionCompatible(bankTx: BankTransaction, bookTx: BookTransaction): boolean {
+    return (bankTx.direction === 'CREDIT' && bookTx.type === 'MONEY_IN') || (bankTx.direction === 'DEBIT' && bookTx.type === 'MONEY_OUT');
   }
 
   private buildMatch(bankTx: BankTransaction, bookTx: BookTransaction, sessionId: string, actor: string, matchType: MatchType): ReconciliationMatch {
@@ -815,9 +866,9 @@ export class ReconciliationService {
     const amountMatch = new DecimalMoney(bankTx.amount).compare(new DecimalMoney(bookTx.amount)) === 0;
     const sameDate = bankTx.date === bookTx.date;
     const referenceMatch = !!bookTx.referenceNo && bankTx.reference.toLowerCase().includes(bookTx.referenceNo.toLowerCase());
-    const descriptionMatch = this.similarity(bankTx.normalizedDescription, bookTx.description) >= 0.5;
+    const descriptionMatch = this.similarity(bankTx.normalizedDescription, this.normalizeDescription(bookTx.description)) >= 0.5;
     const dateTolerance = Math.abs(new Date(bankTx.date).getTime() - new Date(bookTx.date).getTime()) / 86400000 <= this.dateToleranceDays;
-    const directionValid = (bankTx.direction === 'CREDIT' && bookTx.type === 'MONEY_IN') || (bankTx.direction === 'DEBIT' && bookTx.type === 'MONEY_OUT');
+    const directionValid = this.isDirectionCompatible(bankTx, bookTx);
 
     const reasons: string[] = [];
     if (amountMatch) reasons.push('Amount matched');
@@ -874,5 +925,9 @@ export class ReconciliationService {
     const maxLen = Math.max(first.length, second.length);
     const shared = [...new Set(first.split(''))].filter((char) => second.includes(char)).length;
     return shared / Math.max(1, maxLen);
+  }
+
+  private normalizeDescription(value: string): string {
+    return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
   }
 }

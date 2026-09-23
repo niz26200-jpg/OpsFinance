@@ -1,7 +1,8 @@
 import { AccountingEngine, DecimalMoney } from './accounting';
+import type { AccountingRuleService } from './accounting-rules';
 import { TransactionService, type TransactionRecord } from './transactions';
 
-export type UploadType = 'BANK_STATEMENT' | 'PDF' | 'CSV' | 'EXCEL' | 'RECEIPT' | 'INVOICE';
+export type UploadType = 'BANK_STATEMENT' | 'PDF' | 'CSV' | 'EXCEL' | 'RECEIPT' | 'INVOICE' | 'BILL';
 export type ExtractionStatus = 'IMPORTED' | 'PARSED' | 'REVIEW' | 'MAPPED' | 'APPROVED' | 'POSTED' | 'RECONCILED';
 export type DuplicateStatus = 'NONE' | 'POSSIBLE_DUPLICATE' | 'CONFIRMED_DUPLICATE';
 export type TransactionSuggestionType = 'MONEY_IN' | 'MONEY_OUT' | 'TRANSFER' | 'JOURNAL';
@@ -28,6 +29,10 @@ export interface UploadRecord {
   postedAt?: string | null;
   errorInfo?: string[];
   duplicateReference?: string | null;
+  rawData?: string | null;
+  normalizedData?: string | null;
+  importIdentifier?: string | null;
+  metadata?: Record<string, string | number | boolean | null>;
 }
 
 export interface UploadAuditEvent {
@@ -55,6 +60,7 @@ export interface NormalizedRow {
   direction: 'DEBIT' | 'CREDIT';
   balance?: string;
   currency: string;
+  transactionId?: string;
 }
 
 export interface CandidateSuggestion {
@@ -65,6 +71,8 @@ export interface CandidateSuggestion {
   description: string;
   referenceNo?: string;
   date: string;
+  ruleId?: string;
+  ruleMatch?: string;
 }
 
 export interface UploadCandidate {
@@ -98,12 +106,17 @@ export class UploadConvertService {
   private readonly batches = new Map<string, ImportBatch>();
   private readonly uploads = new Map<string, UploadRecord>();
   private readonly hashIndex = new Map<string, string>();
+  private readonly transactionSignatureIndex = new Map<string, string>();
   private readonly idempotency = new Map<string, TransactionRecord>();
   private readonly uploadAuditTrail = new Map<string, UploadAuditEvent[]>();
+  private readonly accountingRules?: AccountingRuleService;
+  private readonly ruleUserId: string;
 
-  constructor(engine: AccountingEngine) {
+  constructor(engine: AccountingEngine, options: { accountingRules?: AccountingRuleService; ruleUserId?: string } = {}) {
     this.engine = engine;
     this.transactionService = new TransactionService(engine);
+    this.accountingRules = options.accountingRules;
+    this.ruleUserId = options.ruleUserId ?? 'system';
   }
 
   createUploadRecord(file: UploadFile, businessId: string, uploadedBy: string, sourceType: UploadType): UploadRecord {
@@ -114,6 +127,7 @@ export class UploadConvertService {
     }
 
     const fileHash = this.generateFileHash(file.content ?? `${file.name}:${file.size}:${file.type}`);
+    const duplicateReference = this.hashIndex.get(`${businessId}:${fileHash}`) ?? null;
     const id = `upload-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const record: UploadRecord = {
       id,
@@ -130,11 +144,19 @@ export class UploadConvertService {
       postedAt: null,
       errorInfo: [],
       duplicateReference: null,
+      rawData: file.content ?? null,
+      normalizedData: null,
+      importIdentifier: fileHash,
+      metadata: { size: file.size, mimeType: file.type, extension: file.name.split('.').pop()?.toLowerCase() ?? '' },
     };
 
     this.uploads.set(id, record);
     this.hashIndex.set(`${businessId}:${fileHash}`, id);
     this.recordAuditEvent(id, businessId, uploadedBy, 'upload_created', id, { filename: file.name, sourceType, fileHash });
+    if (duplicateReference) {
+      record.duplicateReference = duplicateReference;
+      this.recordAuditEvent(id, businessId, uploadedBy, 'duplicate_detected', id, { duplicateReference });
+    }
     return record;
   }
 
@@ -244,17 +266,17 @@ export class UploadConvertService {
 
   validateFile(file: UploadFile): ValidationResult {
     const errors: string[] = [];
-    const allowedMimeTypes = new Map<string, string>([
-      ['text/csv', 'csv'],
-      ['application/csv', 'csv'],
-      ['application/vnd.ms-excel', 'csv'],
-      ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xlsx'],
-      ['application/vnd.ms-excel.sheet.macroenabled.12', 'xls'],
-      ['application/pdf', 'pdf'],
-      ['image/png', 'png'],
-      ['image/jpeg', 'jpg'],
-      ['image/jpg', 'jpg'],
-      ['image/webp', 'webp'],
+    const allowedMimeTypes = new Map<string, string[]>([
+      ['text/csv', ['csv']],
+      ['application/csv', ['csv']],
+      ['application/vnd.ms-excel', ['csv', 'xls']],
+      ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', ['xlsx']],
+      ['application/vnd.ms-excel.sheet.macroenabled.12', ['xls']],
+      ['application/pdf', ['pdf']],
+      ['image/png', ['png']],
+      ['image/jpeg', ['jpg', 'jpeg']],
+      ['image/jpg', ['jpg', 'jpeg']],
+      ['image/webp', ['webp']],
     ]);
     const allowedExtensions = new Set(['csv', 'xls', 'xlsx', 'pdf', 'png', 'jpg', 'jpeg', 'webp']);
     const name = (file.name ?? '').trim();
@@ -268,7 +290,9 @@ export class UploadConvertService {
       errors.push('Filename is unsafe.');
     }
 
-    if (file.type && allowedMimeTypes.has(file.type.toLowerCase()) && extension && allowedMimeTypes.get(file.type.toLowerCase()) !== extension) {
+    if (!file.type?.trim()) {
+      errors.push('MIME type is required.');
+    } else if (allowedMimeTypes.has(file.type.toLowerCase()) && extension && !allowedMimeTypes.get(file.type.toLowerCase())?.includes(extension)) {
       errors.push('MIME type does not match the file extension.');
     }
 
@@ -276,7 +300,7 @@ export class UploadConvertService {
       errors.push('Unsupported MIME type.');
     }
 
-    if (file.size <= 0) {
+    if (!Number.isFinite(file.size) || file.size <= 0) {
       errors.push('File is empty.');
     }
 
@@ -300,8 +324,27 @@ export class UploadConvertService {
     return (hash >>> 0).toString(16).padStart(8, '0');
   }
 
-  private buildDuplicateSignature(candidate: { date: string; description: string; amount: string; reference?: string; accountId?: string }): string {
-    return `${candidate.date}|${candidate.description.trim().toLowerCase()}|${candidate.amount}|${candidate.reference ?? ''}|${candidate.accountId ?? ''}`;
+  private buildDuplicateSignature(candidate: { date: string; description: string; amount: string; reference?: string; accountId?: string; transactionId?: string }): string {
+    return `${candidate.date}|${this.normalizeDescription(candidate.description).toLowerCase()}|${candidate.amount}|${this.normalizeReference(candidate.reference ?? '').toLowerCase()}|${candidate.accountId ?? ''}|${candidate.transactionId ?? ''}`;
+  }
+
+  private suggestionFor(description: string, fallback: CandidateSuggestion, businessId: string): CandidateSuggestion {
+    if (!this.accountingRules) return fallback;
+    const preview = this.accountingRules.preview({ businessId, userId: this.ruleUserId, description });
+    if (!preview.matched || !preview.rule?.autoSuggest || !preview.suggestion) return fallback;
+    const transactionType = preview.suggestion.transactionType === 'INCOME'
+      ? 'MONEY_IN'
+      : preview.suggestion.transactionType === 'EXPENSE'
+        ? 'MONEY_OUT'
+        : fallback.type;
+    return {
+      ...fallback,
+      type: transactionType,
+      accountId: preview.suggestion.accountId ?? fallback.accountId,
+      financialAccountId: preview.suggestion.financialAccountId ?? fallback.financialAccountId,
+      ruleId: preview.rule.id,
+      ruleMatch: preview.suggestion.matchValue,
+    };
   }
 
   private createRejectedUpload(fileName: string, businessId: string, uploadedBy: string, fileHash: string, sourceType: UploadType, errors: string[], duplicateReference?: string | null): UploadRecord {
@@ -461,12 +504,26 @@ export class UploadConvertService {
     this.recordAuditEvent(uploadId, businessId, uploadedBy, 'upload_parsed', uploadId, { filename: fileName, fileHash, candidateCount: 0 });
 
     const header = this.parseCsvRow(rows[0]);
+    const normalizedHeader = header.map((value) => value.trim().toLowerCase());
+    const hasDate = normalizedHeader.includes('date') || normalizedHeader.includes('transactiondate');
+    const hasDescription = normalizedHeader.includes('description') || normalizedHeader.includes('narration');
+    const hasAmount = normalizedHeader.some((value) => ['amount', 'debit', 'credit'].includes(value));
+    if (!hasDate || !hasDescription || !hasAmount) {
+      const errors = ['CSV must include date, description or narration, and amount, debit, or credit columns.'];
+      const upload = this.createRejectedUpload(fileName, businessId, uploadedBy, fileHash, 'BANK_STATEMENT', errors, duplicateUploadRef ?? null);
+      this.hashIndex.set(`${businessId}:${fileHash}`, upload.id);
+      return { id: `batch-${Date.now()}`, businessId, fileName, source: 'BANK_STATEMENT', uploadedBy, uploadedAt: new Date().toISOString(), status: 'REVIEW', candidates: [], errors: [{ error: errors[0], action: 'REJECT' }] };
+    }
     const seen = new Map<string, number>();
     const candidates: UploadCandidate[] = [];
     const errors: Array<{ row?: string; error: string; action: string }> = [];
 
     for (const [index, rowText] of rows.slice(1).entries()) {
       const row = this.parseCsvRow(rowText);
+      if (row.length !== header.length) {
+        errors.push({ row: `Row ${index + 2}`, error: 'CSV row has an unexpected number of columns.', action: 'REVIEW' });
+        continue;
+      }
       const record = Object.fromEntries(header.map((key, i) => [key.toLowerCase(), row[i] ?? '']));
       const date = this.normalizeDate(String(record.date ?? record.transactiondate ?? ''));
       const rawAmount = this.firstNonEmptyString(String(record.amount ?? ''), String(record.debit ?? ''), String(record.credit ?? ''), '0');
@@ -475,16 +532,19 @@ export class UploadConvertService {
       const amount = this.normalizeAmount(rawAmount || debit || credit || '0');
       const direction = this.detectDirection(rawAmount || amount, debit, credit);
 
-      if (!date || amount === '0.00') {
+      if (!this.isValidIsoDate(date) || amount === '0.00' || !this.isValidAmount(rawAmount || debit || credit)) {
         errors.push({ row: `Row ${index + 2}`, error: 'Malformed or empty transaction row.', action: 'REVIEW' });
         continue;
       }
 
       const description = this.normalizeDescription(String(record.description ?? record.narration ?? 'Bank transaction'));
       const reference = this.normalizeReference(String(record.reference ?? record.description ?? ''));
-      const signature = this.buildDuplicateSignature({ date, description, amount, reference, accountId: 'bank-account' });
+      const transactionId = this.normalizeReference(String(record.transactionid ?? record.transaction_id ?? record.id ?? ''));
+      const signature = this.buildDuplicateSignature({ date, description, amount, reference, accountId: 'bank-account', transactionId });
       const currentCount = seen.get(signature) ?? 0;
       seen.set(signature, currentCount + 1);
+      const signatureKey = `${businessId}:${signature}`;
+      const priorCandidateId = this.transactionSignatureIndex.get(signatureKey);
 
       const suggestionType: TransactionSuggestionType = direction === 'CREDIT' ? 'MONEY_IN' : 'MONEY_OUT';
       const accounts = this.resolveSuggestionAccounts();
@@ -503,10 +563,11 @@ export class UploadConvertService {
           direction,
           balance: this.normalizeAmount(String(record.balance ?? '0.00')),
           currency: 'MYR',
+          transactionId: transactionId || undefined,
         },
-        duplicateStatus: effectiveDuplicateReference ? 'CONFIRMED_DUPLICATE' : currentCount > 0 ? 'POSSIBLE_DUPLICATE' : 'NONE',
+        duplicateStatus: effectiveDuplicateReference ? 'CONFIRMED_DUPLICATE' : currentCount > 0 || priorCandidateId ? 'POSSIBLE_DUPLICATE' : 'NONE',
         status: 'PARSED',
-        suggestion: {
+        suggestion: this.suggestionFor(description, {
           type: suggestionType,
           financialAccountId: accounts.bankAccountId,
           accountId: suggestionType === 'MONEY_IN' ? accounts.revenueAccountId : accounts.expenseAccountId,
@@ -514,11 +575,12 @@ export class UploadConvertService {
           description,
           referenceNo: reference || undefined,
           date,
-        },
+        }, businessId),
         confidence: suggestionType === 'MONEY_IN' ? 92 : 88,
         auditTrail: [`Imported ${description}`],
       };
       candidates.push(candidate);
+      this.transactionSignatureIndex.set(signatureKey, candidate.id);
     }
 
     const batch: ImportBatch = {
@@ -532,6 +594,9 @@ export class UploadConvertService {
       candidates,
       errors,
     };
+    uploadRecord.normalizedData = JSON.stringify(candidates.map((candidate) => candidate.normalized));
+    uploadRecord.importIdentifier = `${businessId}:${fileHash}`;
+    this.uploads.set(uploadId, uploadRecord);
     this.batches.set(batch.id, batch);
     if (effectiveDuplicateReference) {
       this.recordAuditEvent(uploadId, businessId, uploadedBy, 'duplicate_detected', uploadId, { duplicateReference: effectiveDuplicateReference, candidateCount: candidates.length });
@@ -546,9 +611,11 @@ export class UploadConvertService {
     this.engine.authorizeBusiness(input.businessId, this.engine.businessId);
     const invoiceRef = /(?:invoice|bill)[^\n]*[:\s]+([A-Z0-9-]+)/i.exec(input.rawText)?.[1] ?? 'INV-UNKNOWN';
     const totalMatch = /(?:total|amount|grand total)[^\d]*(\d+(?:,\d{3})*(?:\.\d{2})?)/i.exec(input.rawText) ?? /RM\s*(\d+(?:,\d{3})*(?:\.\d{2})?)/i.exec(input.rawText);
-    const amount = this.normalizeAmount((totalMatch?.[1] ?? '2000.00').replace(/,/g, ''));
+    if (!totalMatch) throw new Error('Invoice amount is required.');
+    const amount = this.normalizeAmount(totalMatch[1].replace(/,/g, ''));
     const dateMatch = /(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/i.exec(input.rawText);
-    const date = dateMatch ? this.normalizeDate(dateMatch[1]) : '2026-09-01';
+    if (!dateMatch) throw new Error('Invoice date is required.');
+    const date = this.normalizeDate(dateMatch[1]);
 
     return {
       id: `candidate-${Date.now()}`,
@@ -584,9 +651,11 @@ export class UploadConvertService {
     this.engine.authorizeBusiness(input.businessId, this.engine.businessId);
     const receiptRef = /(?:receipt|rct)[^\n]*[:\s]+([A-Z0-9-]+)/i.exec(input.rawText)?.[1] ?? 'RCP-UNKNOWN';
     const totalMatch = /(?:total|amount|grand total)[^\d]*(\d+(?:,\d{3})*(?:\.\d{2})?)/i.exec(input.rawText) ?? /RM\s*(\d+(?:,\d{3})*(?:\.\d{2})?)/i.exec(input.rawText);
-    const amount = this.normalizeAmount((totalMatch?.[1] ?? '300.00').replace(/,/g, ''));
+    if (!totalMatch) throw new Error('Receipt amount is required.');
+    const amount = this.normalizeAmount(totalMatch[1].replace(/,/g, ''));
     const dateMatch = /(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/i.exec(input.rawText);
-    const date = dateMatch ? this.normalizeDate(dateMatch[1]) : '2026-09-01';
+    if (!dateMatch) throw new Error('Receipt date is required.');
+    const date = this.normalizeDate(dateMatch[1]);
 
     return {
       id: `candidate-${Date.now()}`,
@@ -771,6 +840,17 @@ export class UploadConvertService {
     const cleaned = String(value ?? '0').replace(/[RM\s,]/gi, '').replace(/[^0-9.-]/g, '');
     const asNumber = Number(cleaned || '0');
     return Number.isFinite(asNumber) ? new DecimalMoney(asNumber).toString() : '0.00';
+  }
+
+  private isValidAmount(value: string): boolean {
+    const cleaned = String(value ?? '').replace(/[RM\s,]/gi, '');
+    return /^-?\d+(?:\.\d{1,2})?$/.test(cleaned) && new DecimalMoney(cleaned).isPositive();
+  }
+
+  private isValidIsoDate(value: string): boolean {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const parsed = new Date(`${value}T00:00:00Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
   }
 
   private detectDirection(value: string, debit?: string, credit?: string): 'DEBIT' | 'CREDIT' {

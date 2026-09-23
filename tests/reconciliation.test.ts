@@ -561,4 +561,45 @@ describe('Phase 5 bank reconciliation', () => {
     expect(corrected.action).toBe('CORRECTION');
     expect(service.getAuditTrail(session.id).some((event) => event.action === 'CORRECTION')).toBe(true);
   });
+
+  it('leaves ambiguous equal-confidence candidates unmatched for review', () => {
+    const service = new ReconciliationService(engine);
+    service.createStatement({
+      id: 'stmt-ambiguous',
+      businessId,
+      financialAccountId: bankAccountId,
+      name: 'Ambiguous statement',
+      startDate: '2026-09-01',
+      endDate: '2026-09-30',
+      openingBalance: '1000.00',
+      closingBalance: '1100.00',
+    });
+    service.createSession({ id: 'session-ambiguous', businessId, financialAccountId: bankAccountId, statementId: 'stmt-ambiguous', actor: 'user-1' });
+    service.addBankTransactions('stmt-ambiguous', [{
+      id: 'bank-ambiguous',
+      statementId: 'stmt-ambiguous',
+      businessId,
+      financialAccountId: bankAccountId,
+      date: '2026-09-20',
+      description: 'Payment',
+      normalizedDescription: 'payment',
+      reference: 'PAY-AMB',
+      debit: '',
+      credit: '100.00',
+      amount: '100.00',
+      balance: '1100.00',
+      direction: 'CREDIT',
+      source: 'csv',
+      status: 'IMPORTED',
+    }]);
+    service.addBookTransactions([
+      { id: 'book-ambiguous-a', businessId, financialAccountId: bankAccountId, date: '2026-09-20', description: 'Payment', amount: '100.00', type: 'MONEY_IN', status: 'POSTED', journalId: 'journal-a' },
+      { id: 'book-ambiguous-b', businessId, financialAccountId: bankAccountId, date: '2026-09-20', description: 'Payment', amount: '100.00', type: 'MONEY_IN', status: 'POSTED', journalId: 'journal-b' },
+    ]);
+
+    const candidates = service.generateMatches('stmt-ambiguous');
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].status).toBe('UNMATCHED');
+    expect(candidates[0].reasons).toContain('No eligible book transaction');
+  });
 });

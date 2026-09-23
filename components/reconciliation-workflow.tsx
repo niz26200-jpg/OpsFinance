@@ -131,7 +131,7 @@ export function ReconciliationWorkflow() {
       return service.getUnmatchedBankTransactions(statement.id);
     }
     if (tab === 'UNMATCHED_BOOK') {
-      return service.getUnmatchedBankTransactions(statement.id);
+      return [];
     }
     if (tab === 'PARTIAL') {
       return bankTransactions.filter((tx) => matches.some((match) => match.sessionId === session.id && match.bankTransactionId === tx.id && match.status === 'PARTIAL'));

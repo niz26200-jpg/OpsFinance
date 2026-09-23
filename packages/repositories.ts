@@ -1,5 +1,7 @@
 import type { JournalEntry } from './accounting';
 import type { TransactionRecord } from './transactions';
+import type { BankTransaction, FinancialStatement, ReconciliationSession } from './reconciliation';
+import type { UploadRecord } from './upload';
 
 export interface RepositoryError extends Error {
   code?: string;
@@ -21,6 +23,22 @@ export interface TransactionRepository<T extends TransactionRecord> extends Acco
 }
 
 export interface JournalRepository<T extends JournalEntry> extends AccountRepository<T> {
+  listByBusiness(businessId: string): T[];
+}
+
+export interface UploadRepository<T extends UploadRecord = UploadRecord> extends AccountRepository<T> {
+  listByBusiness(businessId: string): T[];
+}
+
+export interface BankStatementRepository<T extends FinancialStatement = FinancialStatement> extends AccountRepository<T> {
+  listByBusiness(businessId: string): T[];
+}
+
+export interface BankTransactionRepository<T extends BankTransaction = BankTransaction> extends AccountRepository<T> {
+  listByBusiness(businessId: string): T[];
+}
+
+export interface ReconciliationRepository<T extends ReconciliationSession = ReconciliationSession> extends AccountRepository<T> {
   listByBusiness(businessId: string): T[];
 }
 
@@ -60,3 +78,11 @@ export class LocalFinancialAccountRepository<T extends { businessId: string; id:
 export class LocalTransactionRepository extends LocalAccountRepository<TransactionRecord> implements TransactionRepository<TransactionRecord> {}
 
 export class LocalJournalRepository extends LocalAccountRepository<JournalEntry> implements JournalRepository<JournalEntry> {}
+
+export class LocalUploadRepository extends LocalAccountRepository<UploadRecord> implements UploadRepository {}
+
+export class LocalBankStatementRepository extends LocalAccountRepository<FinancialStatement> implements BankStatementRepository {}
+
+export class LocalBankTransactionRepository extends LocalAccountRepository<BankTransaction> implements BankTransactionRepository {}
+
+export class LocalReconciliationRepository extends LocalAccountRepository<ReconciliationSession> implements ReconciliationRepository {}
